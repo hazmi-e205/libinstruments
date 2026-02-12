@@ -1,6 +1,6 @@
 # libinstruments
 
-A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB/network, and remote usbmux proxy connections (sonic-gidevice / go-ios).
+A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB/network, iOS 17+ via QUIC tunnel (picoquic + picotls + lwIP), and remote usbmux proxy connections (sonic-gidevice / go-ios).
 
 ## Features
 
@@ -11,7 +11,7 @@ A standalone, pure C++20 library for communicating with iOS Instruments services
 - **WebDriverAgent** - Launch WDA with automatic port forwarding (HTTP + MJPEG)
 - **Port Forwarding** - TCP relay between host and device
 - **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port (`idevice_new_remote`)
-- **iOS 17+ Support** - Tunnel scaffolding (QUIC tunnel not yet implemented, RSD stub only)
+- **iOS 17+ QUIC Tunnel** - Full tunnel support via picoquic + picotls + lwIP (no root needed)
 - **Cross-Platform** - Windows, Linux, macOS
 
 ## Dependencies
@@ -22,7 +22,9 @@ A standalone, pure C++20 library for communicating with iOS Instruments services
 | libplist | Plist encode/decode (NSKeyedArchiver) | Yes |
 | libusbmuxd | USB multiplexing, port forwarding | Yes |
 | libimobiledevice-glue | Thread/socket helpers | Yes |
-| msquic | QUIC tunnel for iOS 17+ | Optional |
+| picoquic | QUIC protocol (RFC 9000) with datagram extension | Optional (iOS 17+) |
+| picotls | TLS 1.3 backend for picoquic (OpenSSL 1.1.x) | Optional (iOS 17+) |
+| lwIP | Userspace TCP/IP stack (NO_SYS mode) | Optional (iOS 17+) |
 
 ## Building
 
@@ -36,7 +38,7 @@ cmake --build .
 
 Options:
 - `-DINSTRUMENTS_BUILD_TOOL=ON` (default) - Build the CLI tool
-- `-DINSTRUMENTS_HAS_MSQUIC=ON` - Enable QUIC tunnel support
+- `-DINSTRUMENTS_HAS_QUIC=ON` - Enable QUIC tunnel support (picoquic + picotls + lwIP)
 
 ### Premake5 (iDebugTool integration)
 
@@ -114,22 +116,34 @@ inst->WDA().Stop();
 auto inst = Instruments::CreateWithTunnel("192.168.1.100", 5555);
 ```
 
-### iOS 17+ Support Status
+### iOS 17+ QUIC Tunnel
 
-iOS 17+ requires an RSD tunnel for instruments communication. Current status:
-- **QUIC tunnel**: Not yet implemented (requires msquic library, guarded by `INSTRUMENTS_HAS_MSQUIC`)
-- **External tunnel registration**: `TunnelManager::RegisterExternalTunnel()` stores tunnel info but actual RSD protocol is not implemented
-- **Workaround**: Use remote usbmux proxy tools (sonic-gidevice, go-ios) that expose a compatible shared port
+iOS 17+ requires a QUIC tunnel for instruments communication. Enable with `INSTRUMENTS_HAS_QUIC` build flag.
+
+**Stack**: picoquic (QUIC + datagrams) → picotls (TLS 1.3) → OpenSSL 1.1.x, with lwIP as a userspace TCP/IP stack (no root/admin privileges required).
+
+**Tunnel flow**:
+1. QUIC handshake over UDP → stream 0 clientHandshakeRequest
+2. Receives serverHandshakeResponse with IPv6 addresses + RSD port
+3. lwIP initializes userspace TCP/IP with tunnel IPv6
+4. QUIC datagrams forwarded bidirectionally as lwIP IPv6 packets
+5. RSD provider connects via lwIP TCP → HTTP/2 + XPC handshake → service discovery
 
 ```cpp
-// TunnelManager can track tunnel info (for future RSD support)
+// Start a QUIC tunnel to an iOS 17+ device
 TunnelManager mgr;
+mgr.StartTunnel("UDID");
+
+// Or register an external tunnel (pymobiledevice3, ios tunnel start)
 mgr.RegisterExternalTunnel("UDID", "fd75:a1b2::1", 60789);
+
 auto tunnels = mgr.GetActiveTunnels();
 for (const auto& t : tunnels) {
     printf("%s -> %s:%u\n", t.udid.c_str(), t.address.c_str(), t.rsdPort);
 }
 ```
+
+**Alternative**: Remote usbmux proxy tools (sonic-gidevice, go-ios) also work via `Instruments::CreateWithTunnel()`.
 
 ### CLI Tool
 
