@@ -4,7 +4,7 @@
 
 `libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
 
-**Status**: ✅ Working and tested on iOS 15 (as of Feb 2026). Designed to support iOS 14-17+.
+**Status**: ✅ DTX protocol working and tested with process listing on iOS 15 via USB (as of Feb 2026). Designed to support iOS 14-17+.
 
 ## Code Style
 
@@ -250,15 +250,17 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 
 ## Testing Status
 
-### ✅ Verified Working on iOS 15
-- Process listing, launch, kill
+### ✅ Verified Working on iOS 15 via USB
+- **Process listing** - GetProcessList() successfully retrieves running processes
+- **DTX protocol core** - Handshake, message exchange, channel management all working
+- **USB connection** - Direct device connection via libimobiledevice
+
+### 🔄 Implemented But Not Yet Tested
+- Process launch/kill operations
 - FPS monitoring via graphics.opengl
 - Performance monitoring via sysmontap (system + process metrics)
 - Port forwarding
-- DTX protocol handshake and message exchange
 - Remote usbmux proxy connections
-
-### 🔄 Designed But Not Yet Tested
 - iOS 17+ QUIC tunnel support (requires INSTRUMENTS_HAS_QUIC build flag)
 - XCTest service
 - WDA service

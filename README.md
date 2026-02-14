@@ -2,19 +2,21 @@
 
 A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB/network, iOS 17+ via QUIC tunnel (picoquic + picotls + lwIP), and remote usbmux proxy connections (sonic-gidevice / go-ios).
 
-**Status**: ✅ Working and tested on iOS 15. Designed for iOS 14-17+.
+**Status**: ✅ DTX protocol working - process listing tested on iOS 15 via USB. Designed for iOS 14-17+.
 
 ## Features
 
-### ✅ Tested and Working (iOS 15)
-- **Process Management** - List running processes, launch/kill apps
-- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl`
-- **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap`
-- **Port Forwarding** - TCP relay between host and device
-- **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port (`idevice_new_remote`)
+### ✅ Tested and Working
+- **Process Listing** - Get running processes via USB connection (iOS 15)
+- **DTX Protocol** - Handshake, message exchange, channel management (iOS 15)
 - **Cross-Platform** - Windows, Linux, macOS
 
 ### 🔄 Implemented But Not Yet Tested
+- **Process Launch/Kill** - Start and terminate processes
+- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl`
+- **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap`
+- **Port Forwarding** - TCP relay between host and device
+- **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port
 - **XCTest Runner** - Execute XCTest bundles with test result callbacks
 - **WebDriverAgent** - Launch WDA with automatic port forwarding (HTTP + MJPEG)
 - **iOS 17+ QUIC Tunnel** - Full tunnel support via picoquic + picotls + lwIP (no root needed)
@@ -97,10 +99,10 @@ printf("Device: %s\n", info.name.c_str());
 printf("iOS: %s\n", info.version.c_str());
 ```
 
-#### Process Management (✅ Tested on iOS 15)
+#### Process Management
 
 ```cpp
-// List all running processes
+// List all running processes (✅ Tested on iOS 15 via USB)
 std::vector<ProcessInfo> procs;
 Error err = inst->Process().GetProcessList(procs);
 if (err == Error::Success) {
@@ -110,18 +112,18 @@ if (err == Error::Success) {
     }
 }
 
-// Launch an app by bundle ID
+// Launch an app by bundle ID (🔄 Not yet tested)
 int64_t pid = 0;
 err = inst->Process().LaunchApp("com.example.MyApp", pid);
 if (err == Error::Success) {
     printf("Launched app with PID: %lld\n", (long long)pid);
 }
 
-// Kill a process
+// Kill a process (🔄 Not yet tested)
 err = inst->Process().KillProcess(pid);
 ```
 
-#### FPS Monitoring (✅ Tested on iOS 15)
+#### FPS Monitoring (🔄 Not Yet Tested)
 
 ```cpp
 // Start FPS monitoring (1000ms interval)
@@ -140,7 +142,7 @@ inst->FPS().Start(1000,
 inst->FPS().Stop();
 ```
 
-#### Performance Monitoring (✅ Tested on iOS 15)
+#### Performance Monitoring (🔄 Not Yet Tested)
 
 ```cpp
 // Configure performance monitoring
@@ -180,7 +182,7 @@ inst->Performance().Start(config,
 inst->Performance().Stop();
 ```
 
-#### Port Forwarding (✅ Tested on iOS 15)
+#### Port Forwarding (🔄 Not Yet Tested)
 
 ```cpp
 // Forward local port 8080 to device port 80
@@ -225,7 +227,7 @@ if (err != Error::Success) {
 }
 ```
 
-### Remote Usbmux Proxy (✅ Tested)
+### Remote Usbmux Proxy (🔄 Not Yet Tested)
 
 ```cpp
 // Connect via remote usbmux proxy (e.g., sonic-gidevice / go-ios shared port)
