@@ -2,7 +2,9 @@
 
 ## What is this?
 
-`libinstruments` is a pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
+`libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
+
+**Status**: ✅ Working and tested on iOS 15 (as of Feb 2026). Designed to support iOS 14-17+.
 
 ## Code Style
 
@@ -44,19 +46,76 @@ All located in sibling directories under `Externals/`:
 
 ## DTX Protocol Essentials
 
+⚠️ **CRITICAL PROTOCOL DETAILS** - These are lessons learned from debugging iOS 15 connections. Violating any of these will cause immediate connection closure by the device!
+
+### Message Format
+
 - **Magic**: `0x795B3D1F` (little-endian in header: `0x1F 0x3D 0x5B 0x79`)
 - **Header**: 32 bytes (LE), payload header: 16 bytes
 - **Message types**: Ack=0x0, MethodInvocation=0x2, ResponseWithPayload=0x3, Error=0x4, LZ4Compressed=0x0707
-- **PrimitiveDictionary types**: null=0x0A, string=0x01, bytearray=0x02, uint32=0x03, int64=0x06
-- **Fragments**: Fragment 0 is header-only when count > 1, subsequent fragments carry data
-- **SSL**: instruments.remoteserver and testmanagerd.lockdown use handshake-only SSL (handshake then plaintext)
+  - **CRITICAL**: Payload header's messageType field MUST include 0x1000 bit when ExpectsReply=true
+  - Example: MethodInvocation with ExpectsReply=true is `0x1002`, with false is `0x0002`
+  - Per iosif: `type = base_type | (expectsReply ? 0x1000 : 0)`
+  - Both main header `expectsReply` field AND payload header type 0x1000 bit must be consistent
+
+### PrimitiveDictionary Encoding (CRITICAL!)
+
+- **Entry format**: MUST include 4-byte marker (0x0A) before each entry
+  - Per pymobiledevice3 message_aux_t_struct: `marker + type + value`
+  - Without marker: decoder fails with "Truncated entry" errors and device closes connection
+- **Auxiliary header**: `[8 bytes: magic 0x1F0] [8 bytes: data length]`
+  - Per iosif bytearr.c: 8-byte magic 0x1F0, then 8-byte length of data EXCLUDING the 16-byte header
+  - Old format used 4x uint32 fields, causing device to misparse and close connection
+- **Types**: null=0x0A, string=0x01, bytearray=0x02, uint32=0x03, int64=0x06
+  - **Type 0x06 is UNSIGNED uint64_t**, not signed int64_t (per pymobiledevice3 Int64ul)
+
+### Handshake Protocol (CRITICAL!)
+
+Client MUST send `_notifyOfPublishedCapabilities:` immediately after connection or device will close connection.
+
+**Critical requirements**:
+1. **ExpectsReply must be FALSE**: Bidirectional exchange, not request-response
+   - If sent with ExpectsReply=true, device expects ACK protocol that breaks the handshake flow
+2. **Must wait for device response**: Use SendMessageSync() to block until device responds (5 sec timeout)
+   - Device sends its own `_notifyOfPublishedCapabilities:` message back
+   - Matches pymobiledevice3: send_message() then recv_plist() blocks until device responds
+3. **Capability values**: Must use signed int64_t, NOT uint64_t
+   - Per pymobiledevice3: plain Python ints (0, 1, 2) get encoded as signed integers
+   - DTXBlockCompression: int64_t(2), DTXConnection: int64_t(1)
+4. **Message identifier synchronization (MOST IMPORTANT!)**: Must update identifier counter when device sends message
+   - Per pymobiledevice3 lines 512-513: if device sends id=N, next client message must use id>=N+1
+   - Without sync: client reuses device's identifier → device closes connection immediately
+   - DTXChannel::SyncIdentifier() updates counter when receiving messages with conv=0
+
+### ACK Behavior
+
+ONLY send ACK if message.ExpectsReply==true (NO special case for handshake)
+- Device's `_notifyOfPublishedCapabilities:` response has ExpectsReply=false, must NOT ACK it
+- Incorrect ACK causes device to close connection immediately after handshake
+
+### SSL Behavior (Version-Dependent)
+
+- **Pre-iOS 14**: `com.apple.instruments.remoteserver` uses **handshake-only SSL** (SSL handshake for auth, then plaintext DTX)
+- **iOS 14-16**: `com.apple.instruments.remoteserver.DVTSecureSocketProxy` uses **full SSL** (all DTX traffic encrypted)
+- **iOS 17+**: `com.apple.instruments.dtservicehub` via RSD tunnel uses **no service-level SSL** (tunnel handles encryption)
+
+### Fragments
+
+- Fragment 0 is header-only when count > 1, subsequent fragments carry data
 
 ## Service Name Selection
 
 ```
-iOS < 14:  com.apple.instruments.remoteserver
-iOS 14-16: com.apple.instruments.remoteserver.DVTSecureSocketProxy
-iOS 17+:   com.apple.instruments.dtservicehub
+iOS < 14:  com.apple.instruments.remoteserver                      (handshake-only SSL)
+iOS 14-16: com.apple.instruments.remoteserver.DVTSecureSocketProxy (full SSL)
+iOS 17+:   com.apple.instruments.dtservicehub                      (RSD tunnel, no service SSL)
+```
+
+TestManagerD follows the same pattern:
+```
+iOS < 14:  com.apple.testmanagerd.lockdown        (handshake-only SSL)
+iOS 14+:   com.apple.testmanagerd.lockdown.secure (full SSL)
+iOS 17+:   com.apple.dt.testmanagerd.remote       (RSD tunnel)
 ```
 
 ## Channel Identifiers
@@ -166,18 +225,115 @@ auto reply = channel->SendMessageSync(msg);
 auto payload = reply->PayloadObject();  // NSKeyedArchiver-decoded result
 ```
 
-## Reference Implementation
+## Reference Implementations
 
-Ported from [go-ios](https://github.com/danielpaulus/go-ios) (Go), adapted to C++20 idioms:
-- Go channels → `std::condition_variable` waiters
-- Goroutines → `std::thread`
-- `io.Copy` → bidirectional relay threads with select/poll
-- Go interfaces → `std::function` callbacks
+Ported from and validated against multiple iOS tools:
+
+- **[go-ios](https://github.com/danielpaulus/go-ios)** (Go) - Primary reference for DTX protocol, adapted to C++20:
+  - Go channels → `std::condition_variable` waiters
+  - Goroutines → `std::thread`
+  - `io.Copy` → bidirectional relay threads with select/poll
+  - Go interfaces → `std::function` callbacks
+
+- **[pymobiledevice3](https://github.com/doronz88/pymobiledevice3)** (Python) - SSL behavior reference:
+  - Validated SSL handling: pre-14 handshake-only vs iOS 14+ full SSL
+  - DTX message format and NSKeyedArchiver encoding
+  - Service name selection and RSD tunnel implementation
+  - Location: `pymobiledevice3/services/dvt/` and `pymobiledevice3/services/remote_server.py`
+
+- **[sonic-gidevice](https://github.com/SonicCloudOrg/sonic-gidevice)** (Go) - Remote usbmux proxy and DTX protocol reference:
+  - Remote device communication via usbmux proxy
+  - DTX protocol implementation and message handling
+  - Alternative Go-based approach to iOS device communication
 
 Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code references and old implementation on `devicebridge_instrument.cpp`.
 
+## Testing Status
+
+### ✅ Verified Working on iOS 15
+- Process listing, launch, kill
+- FPS monitoring via graphics.opengl
+- Performance monitoring via sysmontap (system + process metrics)
+- Port forwarding
+- DTX protocol handshake and message exchange
+- Remote usbmux proxy connections
+
+### 🔄 Designed But Not Yet Tested
+- iOS 17+ QUIC tunnel support (requires INSTRUMENTS_HAS_QUIC build flag)
+- XCTest service
+- WDA service
+- iOS < 14 and iOS 16+ versions (protocol design supports them)
+
+## Debugging Journey & Lessons Learned (Feb 2026)
+
+This library was successfully implemented after fixing several critical protocol issues that caused immediate connection closure by iOS 15 devices. These issues are documented here to prevent regressions.
+
+### Problem 1: Message Identifier Collision (MOST CRITICAL)
+**Symptom**: Device closes connection immediately after handshake, no obvious error message.
+
+**Root Cause**: Client was reusing message identifier 0 after device sent a message with id=0. When both client and device send messages with the same identifier simultaneously, the device closes the connection.
+
+**Fix**: Implement identifier synchronization - when device sends a message with id=N on conversation=0 (unsolicited message), client must update its counter to id>=N+1 before sending next message. Implemented in `DTXChannel::SyncIdentifier()`.
+
+**Reference**: pymobiledevice3 lines 512-513, go-ios identifier management.
+
+### Problem 2: PrimitiveDictionary Missing Markers
+**Symptom**: Device logs "Truncated entry" errors and closes connection when receiving client messages.
+
+**Root Cause**: PrimitiveDictionary entries were encoded as `[type][value]` without the required 4-byte marker (0x0A) prefix. Device's decoder expects `[marker=0x0A][type][value]` for each entry.
+
+**Fix**: Modified `DTXPrimitiveDict::Encode()` to write 0x0A marker before each entry.
+
+**Reference**: pymobiledevice3 message_aux_t_struct format.
+
+### Problem 3: Incorrect Auxiliary Header Format
+**Symptom**: Device misparses auxiliary data, sends back malformed responses, closes connection.
+
+**Root Cause**: Auxiliary header used 4x uint32 fields (old format), but device expects 8-byte magic (0x1F0) followed by 8-byte length (excluding the 16-byte header itself).
+
+**Fix**: Changed header format to `[uint64 magic=0x1F0][uint64 length]`.
+
+**Reference**: iosif bytearr.c auxiliary encoding.
+
+### Problem 4: Missing 0x1000 Bit in Payload MessageType
+**Symptom**: Device doesn't respond to messages that should get replies.
+
+**Root Cause**: Payload header messageType field was set to base type (e.g., 0x0002 for MethodInvocation) without including the 0x1000 bit when ExpectsReply=true.
+
+**Fix**: Set messageType = baseType | (expectsReply ? 0x1000 : 0). E.g., MethodInvocation with reply is 0x1002, without is 0x0002.
+
+**Reference**: iosif dtxpayload__new implementation.
+
+### Problem 5: Handshake Message with ExpectsReply=true
+**Symptom**: Device closes connection immediately after handshake exchange.
+
+**Root Cause**: Client sent handshake message with ExpectsReply=true, causing device to wait for ACK. But handshake is a bidirectional exchange, not request-response, so ACK protocol breaks the flow.
+
+**Fix**: Send handshake with ExpectsReply=false, but still wait for device's response using SendMessageSync() with timeout.
+
+**Reference**: pymobiledevice3 DvtSecureSocketProxyService handshake implementation.
+
+### Problem 6: Type 0x06 Signed vs Unsigned
+**Symptom**: Capability values in handshake misinterpreted by device, causing protocol errors.
+
+**Root Cause**: Type 0x06 in PrimitiveDictionary is UNSIGNED uint64_t (per pymobiledevice3 Int64ul), but we were using signed int64_t for both encoding and decoding. However, capability VALUES must be signed integers (per Python int encoding).
+
+**Fix**: Use uint64_t for type 0x06 read/write operations, but use int64_t for capability values in handshake. This distinction is critical.
+
+**Reference**: pymobiledevice3 message_aux_t_struct line 87 (Int64ul = unsigned).
+
+### Key Takeaways
+1. **Always sync message identifiers** when device sends unsolicited messages
+2. **PrimitiveDictionary format is strict** - must include 0x0A marker before each entry
+3. **Handshake is bidirectional** - not request-response, so ExpectsReply=false
+4. **Payload messageType includes 0x1000 bit** when expecting replies
+5. **Type encoding vs value semantics** - type 0x06 is uint64_t, but capability values are signed
+
 ## Things to Watch Out For
 
+- **DTX handshake is mandatory and complex**: See "Handshake Protocol" section above for all critical requirements
+- **Message identifier synchronization**: MUST sync counter when device sends messages (most common failure mode)
+- **PrimitiveDictionary format**: MUST include 0x0A marker before each entry
 - DTX message identifiers must be unique per connection (monotonic counter)
 - Channel code 0 is the global channel (auto-created, never explicitly requested)
 - Fragment reassembly is keyed by message identifier

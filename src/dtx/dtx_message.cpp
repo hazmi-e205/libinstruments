@@ -24,6 +24,13 @@ static void WriteLE32(uint8_t* p, uint32_t val) {
     p[3] = (val >> 24) & 0xFF;
 }
 
+static void WriteBE32(uint8_t* p, uint32_t val) {
+    p[0] = (val >> 24) & 0xFF;
+    p[1] = (val >> 16) & 0xFF;
+    p[2] = (val >> 8) & 0xFF;
+    p[3] = val & 0xFF;
+}
+
 static uint16_t ReadLE16(const uint8_t* p) {
     return static_cast<uint16_t>(p[0]) | (static_cast<uint16_t>(p[1]) << 8);
 }
@@ -123,28 +130,49 @@ bool DTXMessage::ParseHeader(const uint8_t* data, size_t length, DTXMessageHeade
 }
 
 std::vector<std::vector<uint8_t>> DTXMessage::Encode() const {
-    // Build payload section: payloadHeader + auxiliary + payload
     size_t auxLen = m_auxiliary.size();
     size_t payloadLen = m_payload.size();
-    size_t totalPayloadLen = auxLen + payloadLen;
+    size_t auxLenWithHeader = auxLen > 0 ? auxLen + DTXProtocol::PayloadHeaderLength : 0;
+    size_t totalPayloadLen = auxLenWithHeader + payloadLen;
+    bool hasPayload = (totalPayloadLen > 0 ||
+                       MessageType() != DTXMessageType::Ack);
 
     std::vector<uint8_t> payloadSection;
-    // Payload header (16 bytes)
-    payloadSection.resize(DTXProtocol::PayloadHeaderLength);
-    WriteLE32(payloadSection.data(), m_payloadHeader.messageType);
-    WriteLE32(payloadSection.data() + 4, static_cast<uint32_t>(auxLen));
-    WriteLE32(payloadSection.data() + 8, static_cast<uint32_t>(totalPayloadLen));
-    WriteLE32(payloadSection.data() + 12, m_payloadHeader.flags);
+    if (hasPayload) {
+        // Payload header (16 bytes) + auxiliary + payload
+        payloadSection.resize(DTXProtocol::PayloadHeaderLength);
+        INST_LOG_INFO(TAG, "Encoding message: messageType=0x%04X (raw), expectsReply=%d, auxLen=%zu, totalLen=%zu",
+                     m_payloadHeader.messageType,
+                     m_header.expectsReply,
+                     auxLenWithHeader,
+                     totalPayloadLen);
+        WriteLE32(payloadSection.data(), m_payloadHeader.messageType);
+        WriteLE32(payloadSection.data() + 4, static_cast<uint32_t>(auxLenWithHeader));
+        WriteLE32(payloadSection.data() + 8, static_cast<uint32_t>(totalPayloadLen));
+        WriteLE32(payloadSection.data() + 12, m_payloadHeader.flags);
 
-    // Auxiliary data
-    payloadSection.insert(payloadSection.end(), m_auxiliary.begin(), m_auxiliary.end());
+        if (auxLen > 0) {
+            // 16-byte auxiliary header: magic (0x1F0) + aux size
+            const uint64_t magic = 0x1F0;
+            const uint64_t auxSize = static_cast<uint64_t>(auxLen);
+            uint8_t auxHeader[DTXProtocol::PayloadHeaderLength];
+            for (int i = 0; i < 8; i++) {
+                auxHeader[i] = static_cast<uint8_t>((magic >> (i * 8)) & 0xFF);
+            }
+            for (int i = 0; i < 8; i++) {
+                auxHeader[8 + i] = static_cast<uint8_t>((auxSize >> (i * 8)) & 0xFF);
+            }
+            payloadSection.insert(payloadSection.end(), auxHeader, auxHeader + DTXProtocol::PayloadHeaderLength);
+            payloadSection.insert(payloadSection.end(), m_auxiliary.begin(), m_auxiliary.end());
+        }
+        payloadSection.insert(payloadSection.end(), m_payload.begin(), m_payload.end());
+    }
+    // ACK messages: no payload section (messageLength = 0)
 
-    // Payload data
-    payloadSection.insert(payloadSection.end(), m_payload.begin(), m_payload.end());
-
-    // Build complete message: header + payload section
+    // Build complete message: header + optional payload section
     std::vector<uint8_t> message(DTXProtocol::HeaderLength);
-    WriteLE32(message.data(), DTXProtocol::Magic);
+    // Magic is written big-endian (matches go-ios fixtures)
+    WriteBE32(message.data(), DTXProtocol::Magic);
     WriteLE32(message.data() + 4, DTXProtocol::HeaderLength);
     WriteLE16(message.data() + 8, 0);  // fragmentIndex
     WriteLE16(message.data() + 10, 1); // fragmentCount
@@ -221,7 +249,13 @@ std::shared_ptr<DTXMessage> DTXMessage::Decode(const DTXMessageHeader& header,
     // Non-compressed: extract auxiliary and payload
     size_t auxLen = msg->m_payloadHeader.auxiliaryLength;
     if (auxLen > 0 && auxLen <= remaining) {
-        msg->m_auxiliary.assign(payloadStart, payloadStart + auxLen);
+        if (auxLen <= DTXProtocol::PayloadHeaderLength) {
+            INST_LOG_WARN(TAG, "Auxiliary length too small: %zu bytes", auxLen);
+        } else {
+            const uint8_t* auxStart = payloadStart + DTXProtocol::PayloadHeaderLength;
+            size_t auxDataLen = auxLen - DTXProtocol::PayloadHeaderLength;
+            msg->m_auxiliary.assign(auxStart, auxStart + auxDataLen);
+        }
     }
 
     size_t payloadDataOffset = auxLen;

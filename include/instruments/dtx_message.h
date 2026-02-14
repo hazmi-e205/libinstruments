@@ -62,13 +62,17 @@ public:
     void SetConversationIndex(uint32_t idx) { m_header.conversationIndex = idx; }
 
     bool ExpectsReply() const { return m_header.expectsReply != 0; }
-    void SetExpectsReply(bool v) { m_header.expectsReply = v ? 1 : 0; }
+    void SetExpectsReply(bool v) {
+        m_header.expectsReply = v ? 1 : 0;
+    }
 
     uint16_t FragmentIndex() const { return m_header.fragmentIndex; }
     uint16_t FragmentCount() const { return m_header.fragmentCount; }
 
     DTXMessageType MessageType() const { return static_cast<DTXMessageType>(m_payloadHeader.messageType); }
-    void SetMessageType(DTXMessageType type) { m_payloadHeader.messageType = static_cast<uint32_t>(type); }
+    void SetMessageType(DTXMessageType type) {
+        m_payloadHeader.messageType = static_cast<uint32_t>(type);
+    }
 
     // Payload - the selector or return value (NSKeyedArchiver encoded)
     void SetPayload(const NSObject& obj);

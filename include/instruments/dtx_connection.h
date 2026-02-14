@@ -5,6 +5,7 @@
 #include "dtx_message.h"
 #include "types.h"
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -72,6 +73,9 @@ public:
 private:
     explicit DTXConnection(std::unique_ptr<DTXTransport> transport);
 
+    // Perform DTX protocol handshake (send client capabilities)
+    Error PerformHandshake();
+
     // Receive loop running on background thread
     void ReceiveLoop();
 
@@ -96,6 +100,11 @@ private:
     // Global message handler
     DTXChannel::MessageHandler m_globalHandler;
     std::mutex m_globalHandlerMutex;
+
+    // Handshake synchronization
+    std::mutex m_handshakeMutex;
+    std::condition_variable m_handshakeCV;
+    std::atomic<bool> m_handshakeReceived{false};
 };
 
 } // namespace instruments

@@ -7,11 +7,15 @@ namespace instruments {
 
 static const char* TAG = "ServiceConnector";
 
-// Services that use SSL handshake-only mode (handshake then plaintext)
+// Services that use SSL handshake-only mode (handshake then plaintext).
+// Based on pymobiledevice3 DvtSecureSocketProxyService (remove_ssl_context parameter):
+// - Pre-iOS 14: com.apple.instruments.remoteserver uses SSL handshake-only
+// - iOS 14-16: com.apple.instruments.remoteserver.DVTSecureSocketProxy uses FULL SSL
+// - iOS 17+: com.apple.instruments.dtservicehub uses no SSL (tunnel provides encryption)
 static const char* s_sslHandshakeOnlyServices[] = {
-    "com.apple.instruments.remoteserver",
+    "com.apple.instruments.remoteserver",              // pre-iOS 14 only
     "com.apple.accessibility.axAuditDaemon.remoteserver",
-    "com.apple.testmanagerd.lockdown",
+    "com.apple.testmanagerd.lockdown",                 // pre-iOS 14 only
     "com.apple.debugserver",
     nullptr,
 };

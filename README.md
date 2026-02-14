@@ -2,17 +2,22 @@
 
 A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB/network, iOS 17+ via QUIC tunnel (picoquic + picotls + lwIP), and remote usbmux proxy connections (sonic-gidevice / go-ios).
 
+**Status**: ✅ Working and tested on iOS 15. Designed for iOS 14-17+.
+
 ## Features
 
+### ✅ Tested and Working (iOS 15)
 - **Process Management** - List running processes, launch/kill apps
 - **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl`
 - **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap`
-- **XCTest Runner** - Execute XCTest bundles with test result callbacks
-- **WebDriverAgent** - Launch WDA with automatic port forwarding (HTTP + MJPEG)
 - **Port Forwarding** - TCP relay between host and device
 - **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port (`idevice_new_remote`)
-- **iOS 17+ QUIC Tunnel** - Full tunnel support via picoquic + picotls + lwIP (no root needed)
 - **Cross-Platform** - Windows, Linux, macOS
+
+### 🔄 Implemented But Not Yet Tested
+- **XCTest Runner** - Execute XCTest bundles with test result callbacks
+- **WebDriverAgent** - Launch WDA with automatic port forwarding (HTTP + MJPEG)
+- **iOS 17+ QUIC Tunnel** - Full tunnel support via picoquic + picotls + lwIP (no root needed)
 
 ## Dependencies
 
@@ -28,7 +33,21 @@ A standalone, pure C++20 library for communicating with iOS Instruments services
 
 ## Building
 
-### CMake
+### Prerequisites
+
+Required dependencies (all available as git submodules in iDebugTool's `Externals/` directory):
+- **libimobiledevice** - Device communication
+- **libplist** - Plist encode/decode
+- **libusbmuxd** - USB multiplexing
+- **libimobiledevice-glue** - Utility helpers
+
+Optional dependencies for iOS 17+ QUIC tunnel (if building with `INSTRUMENTS_HAS_QUIC`):
+- **picoquic** - QUIC protocol implementation
+- **picotls** - TLS 1.3 backend (works with OpenSSL 1.1.x)
+- **lwIP** - Userspace TCP/IP stack
+- **OpenSSL 1.1.x** - Cryptography backend
+
+### CMake (Standalone Build)
 
 ```bash
 mkdir build && cd build
@@ -36,87 +55,185 @@ cmake .. -DCMAKE_BUILD_TYPE=Release
 cmake --build .
 ```
 
-Options:
-- `-DINSTRUMENTS_BUILD_TOOL=ON` (default) - Build the CLI tool
-- `-DINSTRUMENTS_HAS_QUIC=ON` - Enable QUIC tunnel support (picoquic + picotls + lwIP)
+CMake Options:
+- `-DINSTRUMENTS_BUILD_TOOL=ON` (default) - Build the CLI tool (`instruments-cli`)
+- `-DINSTRUMENTS_HAS_QUIC=ON` - Enable QUIC tunnel support for iOS 17+ (requires picoquic + picotls + lwIP)
 
-### Premake5 (iDebugTool integration)
+### Premake5 (iDebugTool Integration)
 
 The library is built as a static library via `Prj/libinstruments.lua` when included in the iDebugTool workspace.
 
+```bash
+# From iDebugTool root directory
+cd Prj
+premake5 vs2022  # or vs2019, gmake2, etc.
+```
+
+The Premake build system automatically:
+- Links all required dependencies from `Externals/`
+- Defines `INSTRUMENTS_HAS_QUIC` when picoquic/picotls/lwIP are available
+- Configures include paths and library links
+
 ## Quick Start
 
-### Library API
+### Library API Examples
+
+#### Basic Device Connection
 
 ```cpp
 #include <instruments/instruments.h>
 using namespace instruments;
 
-// Connect to a device by UDID
+// Connect to a device by UDID (auto-detects iOS version and protocol)
 auto inst = Instruments::Create("00008030-001234567890ABCD");
-
-// List processes
-std::vector<ProcessInfo> procs;
-inst->Process().GetProcessList(procs);
-for (const auto& p : procs) {
-    printf("PID: %lld  %s\n", (long long)p.pid, p.name.c_str());
+if (!inst) {
+    fprintf(stderr, "Failed to connect to device\n");
+    return 1;
 }
 
-// Monitor FPS
+// Get device info
+DeviceInfo info = inst->GetDeviceInfo();
+printf("Device: %s\n", info.name.c_str());
+printf("iOS: %s\n", info.version.c_str());
+```
+
+#### Process Management (✅ Tested on iOS 15)
+
+```cpp
+// List all running processes
+std::vector<ProcessInfo> procs;
+Error err = inst->Process().GetProcessList(procs);
+if (err == Error::Success) {
+    for (const auto& p : procs) {
+        printf("PID: %lld  %s  %s\n",
+               (long long)p.pid, p.name.c_str(), p.bundleId.c_str());
+    }
+}
+
+// Launch an app by bundle ID
+int64_t pid = 0;
+err = inst->Process().LaunchApp("com.example.MyApp", pid);
+if (err == Error::Success) {
+    printf("Launched app with PID: %lld\n", (long long)pid);
+}
+
+// Kill a process
+err = inst->Process().KillProcess(pid);
+```
+
+#### FPS Monitoring (✅ Tested on iOS 15)
+
+```cpp
+// Start FPS monitoring (1000ms interval)
 inst->FPS().Start(1000,
     [](const FPSData& data) {
-        printf("FPS: %.0f  GPU: %.1f%%\n", data.fps, data.gpuUtilization);
+        printf("FPS: %.1f  GPU: %.1f%%\n", data.fps, data.gpuUtilization);
     },
     [](Error e, const std::string& msg) {
-        fprintf(stderr, "Error: %s\n", msg.c_str());
+        fprintf(stderr, "FPS Error: %s\n", msg.c_str());
     }
 );
-// ... later
-inst->FPS().Stop();
 
-// Monitor performance
+// ... monitor runs in background ...
+
+// Stop when done
+inst->FPS().Stop();
+```
+
+#### Performance Monitoring (✅ Tested on iOS 15)
+
+```cpp
+// Configure performance monitoring
 PerfConfig config;
-config.sampleIntervalMs = 1000;
+config.sampleIntervalMs = 1000;  // Sample every 1 second
+config.cpuUsage = true;
+config.memoryUsage = true;
+config.diskActivity = true;
+config.networkActivity = true;
+
+// Start monitoring
 inst->Performance().Start(config,
-    [](const SystemMetrics& m) {
-        printf("CPU: %.1f%%\n", m.cpuTotalLoad);
+    // System metrics callback
+    [](const SystemMetrics& sys) {
+        printf("System CPU: %.1f%%  Memory: %llu MB\n",
+               sys.cpuTotalLoad, sys.memUsed / 1024 / 1024);
     },
+    // Process metrics callback
     [](const std::vector<ProcessMetrics>& procs) {
         for (const auto& p : procs) {
-            printf("  PID %lld CPU: %.1f%%\n", (long long)p.pid, p.cpuUsage);
+            if (p.cpuUsage > 5.0) {  // Show processes using > 5% CPU
+                printf("  PID %lld (%s): CPU %.1f%%  Mem %llu MB\n",
+                       (long long)p.pid, p.name.c_str(),
+                       p.cpuUsage, p.memResident / 1024 / 1024);
+            }
         }
     },
-    nullptr
+    // Error callback
+    [](Error e, const std::string& msg) {
+        fprintf(stderr, "Perf Error: %s\n", msg.c_str());
+    }
 );
-// ... later
+
+// ... monitoring runs in background ...
+
+// Stop when done
 inst->Performance().Stop();
+```
 
-// Launch an app
-int64_t pid = 0;
-inst->Process().LaunchApp("com.example.app", pid);
+#### Port Forwarding (✅ Tested on iOS 15)
 
-// Run WebDriverAgent
+```cpp
+// Forward local port 8080 to device port 80
+err = inst->Ports().Forward(8080, 80);
+if (err == Error::Success) {
+    printf("Port forwarding active: localhost:8080 -> device:80\n");
+}
+
+// ... use the forwarded port ...
+
+// Stop forwarding
+inst->Ports().StopForward(8080);
+```
+
+#### WebDriverAgent (🔄 Not Yet Tested)
+
+```cpp
 WDAConfig wdaConfig;
 wdaConfig.bundleId = "com.facebook.WebDriverAgentRunner.xctrunner";
 wdaConfig.wdaPort = 8100;
 wdaConfig.mjpegPort = 9100;
+
 inst->WDA().Start(wdaConfig,
     [](const std::string& log) { printf("[WDA] %s\n", log.c_str()); },
-    nullptr
+    [](Error e, const std::string& msg) { fprintf(stderr, "WDA Error: %s\n", msg.c_str()); }
 );
+
 // WDA available at http://localhost:8100
+// MJPEG stream at http://localhost:9100
+
 // ... later
 inst->WDA().Stop();
 ```
 
-### Remote Usbmux Proxy (sonic-gidevice / go-ios shared port)
+#### Error Handling
 
 ```cpp
-// Connect via remote usbmux proxy (e.g., sonic-gidevice shared port)
+Error err = inst->Process().LaunchApp("com.example.app", pid);
+if (err != Error::Success) {
+    fprintf(stderr, "Failed to launch app: %s\n", ErrorToString(err));
+    // Handle error...
+}
+```
+
+### Remote Usbmux Proxy (✅ Tested)
+
+```cpp
+// Connect via remote usbmux proxy (e.g., sonic-gidevice / go-ios shared port)
+// This is NOT an RSD tunnel - it's a remote usbmux proxy connection
 auto inst = Instruments::CreateWithTunnel("192.168.1.100", 5555);
 ```
 
-### iOS 17+ QUIC Tunnel
+### iOS 17+ QUIC Tunnel (🔄 Not Yet Tested)
 
 iOS 17+ requires a QUIC tunnel for instruments communication. Enable with `INSTRUMENTS_HAS_QUIC` build flag.
 
@@ -143,7 +260,7 @@ for (const auto& t : tunnels) {
 }
 ```
 
-**Alternative**: Remote usbmux proxy tools (sonic-gidevice, go-ios) also work via `Instruments::CreateWithTunnel()`.
+**Alternative**: Remote usbmux proxy tools (sonic-gidevice, go-ios) work via `Instruments::CreateWithTunnel()` even for iOS 17+ devices.
 
 ### CLI Tool
 
@@ -250,11 +367,46 @@ Payload: NSKeyedArchiver-encoded selector or return value
 
 ### Service Names
 
-| iOS Version | Service Identifier |
+| iOS Version | Service Identifier | SSL Mode |
+|---|---|---|
+| < 14 | `com.apple.instruments.remoteserver` | Handshake-only (plaintext DTX) |
+| 14-16 | `com.apple.instruments.remoteserver.DVTSecureSocketProxy` | Full SSL |
+| 17+ | `com.apple.instruments.dtservicehub` | No service SSL (tunnel encrypts) |
+
+## API Reference
+
+All public headers are in `include/instruments/`:
+
+| Header | Description |
 |---|---|
-| < 14 | `com.apple.instruments.remoteserver` |
-| 14-16 | `com.apple.instruments.remoteserver.DVTSecureSocketProxy` |
-| 17+ | `com.apple.instruments.dtservicehub` |
+| `instruments.h` | Main facade class (single include for everything) |
+| `types.h` | Common types, enums, error codes |
+| `device_connection.h` | Low-level device connection management |
+| `tunnel_manager.h` | QUIC tunnel management (iOS 17+) |
+| `dtx_connection.h` | DTX protocol connection layer |
+| `dtx_channel.h` | DTX channel abstraction |
+| `dtx_message.h` | DTX message construction |
+| `process_service.h` | Process management API |
+| `performance_service.h` | Performance monitoring API |
+| `fps_service.h` | FPS monitoring API |
+| `xctest_service.h` | XCTest execution API |
+| `wda_service.h` | WebDriverAgent API |
+| `port_forwarder.h` | Port forwarding API |
+
+## Contributing
+
+When modifying this library:
+1. Read `CLAUDE.md` for developer guidelines and protocol details
+2. Maintain C++20 compatibility (no Qt dependencies)
+3. Test on Windows and Linux
+4. Update both README.md and CLAUDE.md with any protocol or API changes
+5. Follow the code style: PascalCase methods, m_ prefix for members
+
+## References
+
+- **[pymobiledevice3](https://github.com/doronz88/pymobiledevice3)** - Python reference for DTX protocol and iOS communication
+- **[go-ios](https://github.com/danielpaulus/go-ios)** - Go reference implementation (primary DTX reference)
+- **[sonic-gidevice](https://github.com/SonicCloudOrg/sonic-gidevice)** - Go implementation with remote proxy support
 
 ## License
 

@@ -37,10 +37,21 @@ private:
 
 } // namespace instruments
 
-#define INST_LOG_ERROR(tag, ...) ::instruments::Log::Write(::instruments::LogLevel::Error, tag, __VA_ARGS__)
-#define INST_LOG_WARN(tag, ...)  ::instruments::Log::Write(::instruments::LogLevel::Warn, tag, __VA_ARGS__)
-#define INST_LOG_INFO(tag, ...)  ::instruments::Log::Write(::instruments::LogLevel::Info, tag, __VA_ARGS__)
-#define INST_LOG_DEBUG(tag, ...) ::instruments::Log::Write(::instruments::LogLevel::Debug, tag, __VA_ARGS__)
-#define INST_LOG_TRACE(tag, ...) ::instruments::Log::Write(::instruments::LogLevel::Trace, tag, __VA_ARGS__)
+// Guard argument evaluation so expensive calls (e.g. Dump()) are skipped
+// when the log level is above the threshold. Define INSTRUMENTS_ENABLE_LOGGING
+// to compile in logging calls (disabled by default).
+#if defined(INSTRUMENTS_ENABLE_LOGGING)
+#define INST_LOG_ERROR(tag, ...) do { if (::instruments::LogLevel::Error <= ::instruments::Log::GetLevel()) ::instruments::Log::Write(::instruments::LogLevel::Error, tag, __VA_ARGS__); } while(0)
+#define INST_LOG_WARN(tag, ...)  do { if (::instruments::LogLevel::Warn  <= ::instruments::Log::GetLevel()) ::instruments::Log::Write(::instruments::LogLevel::Warn,  tag, __VA_ARGS__); } while(0)
+#define INST_LOG_INFO(tag, ...)  do { if (::instruments::LogLevel::Info  <= ::instruments::Log::GetLevel()) ::instruments::Log::Write(::instruments::LogLevel::Info,  tag, __VA_ARGS__); } while(0)
+#define INST_LOG_DEBUG(tag, ...) do { if (::instruments::LogLevel::Debug <= ::instruments::Log::GetLevel()) ::instruments::Log::Write(::instruments::LogLevel::Debug, tag, __VA_ARGS__); } while(0)
+#define INST_LOG_TRACE(tag, ...) do { if (::instruments::LogLevel::Trace <= ::instruments::Log::GetLevel()) ::instruments::Log::Write(::instruments::LogLevel::Trace, tag, __VA_ARGS__); } while(0)
+#else
+#define INST_LOG_ERROR(tag, ...) do { (void)(tag); } while(0)
+#define INST_LOG_WARN(tag, ...)  do { (void)(tag); } while(0)
+#define INST_LOG_INFO(tag, ...)  do { (void)(tag); } while(0)
+#define INST_LOG_DEBUG(tag, ...) do { (void)(tag); } while(0)
+#define INST_LOG_TRACE(tag, ...) do { (void)(tag); } while(0)
+#endif
 
 #endif // INSTRUMENTS_LOG_H

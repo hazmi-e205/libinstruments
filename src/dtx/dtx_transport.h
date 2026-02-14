@@ -52,6 +52,9 @@ public:
 
     // Check if transport is still connected
     bool IsConnected() const { return m_connected; }
+    bool WasLastReadTimeout() const { return m_lastReadTimeout; }
+    int LastReadError() const { return m_lastReadError; }
+    uint32_t LastReadBytes() const { return m_lastReadBytes; }
 
     // Close the transport
     void Close();
@@ -63,6 +66,9 @@ private:
     idevice_connection_t m_connection = nullptr;
     bool m_ownsConnection = false;
     bool m_connected = false;
+    bool m_lastReadTimeout = false;
+    int m_lastReadError = 0;
+    uint32_t m_lastReadBytes = 0;
     std::mutex m_sendMutex;
     std::mutex m_recvMutex;
 };

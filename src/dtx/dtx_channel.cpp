@@ -2,6 +2,7 @@
 #include "../../include/instruments/dtx_connection.h"
 #include "../util/log.h"
 #include <chrono>
+#include <fstream>
 
 namespace instruments {
 
@@ -42,8 +43,42 @@ std::shared_ptr<DTXMessage> DTXChannel::SendMessageSync(
         m_waiters[msgId] = waiter;
     }
 
-    INST_LOG_DEBUG(TAG, "[%s] SendSync id=%u: %s",
+    INST_LOG_INFO(TAG, "[%s] SendSync id=%u: %s",
                   m_identifier.c_str(), msgId, message->Dump().c_str());
+    if (m_identifier == "_global_" && message->Selector() == "_requestChannelWithCode:identifier:") {
+        const auto& aux = message->RawAuxiliary();
+        const auto& payload = message->RawPayload();
+        INST_LOG_INFO(TAG, "[%s] RequestChannel sizes: aux=%zu, payload=%zu",
+                      m_identifier.c_str(), aux.size(), payload.size());
+        if (aux.size() >= 16) {
+            std::string hexDump;
+            size_t dumpLen = aux.size() < 64 ? aux.size() : 64;
+            for (size_t i = 0; i < dumpLen; i++) {
+                char buf[4];
+                snprintf(buf, sizeof(buf), "%02X ", aux[i]);
+                hexDump += buf;
+                if ((i + 1) % 16 == 0) hexDump += "\n";
+            }
+            INST_LOG_INFO(TAG, "[%s] RequestChannel aux head:\n%s", m_identifier.c_str(), hexDump.c_str());
+        }
+
+        // Dump full encoded message for byte-level comparison with reference fixtures
+        auto frames = message->Encode();
+        if (!frames.empty()) {
+            const char* dumpPath = "request_channel_last.bin";
+            std::ofstream out(dumpPath, std::ios::binary | std::ios::trunc);
+            if (out.is_open()) {
+                out.write(reinterpret_cast<const char*>(frames[0].data()),
+                          static_cast<std::streamsize>(frames[0].size()));
+                out.close();
+                INST_LOG_INFO(TAG, "[%s] RequestChannel dump written: %s (%zu bytes)",
+                              m_identifier.c_str(), dumpPath, frames[0].size());
+            } else {
+                INST_LOG_WARN(TAG, "[%s] Failed to write RequestChannel dump: %s",
+                              m_identifier.c_str(), dumpPath);
+            }
+        }
+    }
 
     // Send the message
     Error err = m_connection->SendMessage(message);
@@ -53,6 +88,8 @@ std::shared_ptr<DTXMessage> DTXChannel::SendMessageSync(
         INST_LOG_ERROR(TAG, "Failed to send message: %s", ErrorToString(err));
         return nullptr;
     }
+    INST_LOG_INFO(TAG, "[%s] Message sent, waiting for response (timeout=%dms)...",
+                  m_identifier.c_str(), timeoutMs);
 
     // Wait for response
     {
@@ -65,10 +102,10 @@ std::shared_ptr<DTXMessage> DTXChannel::SendMessageSync(
             std::lock_guard<std::mutex> wlock(m_waitersMutex);
             m_waiters.erase(msgId);
             if (m_cancelled.load()) {
-                INST_LOG_DEBUG(TAG, "Channel cancelled while waiting for response to id=%u", msgId);
+                INST_LOG_ERROR(TAG, "Channel cancelled while waiting for response to id=%u", msgId);
             } else {
-                INST_LOG_WARN(TAG, "Timeout waiting for response to id=%u on %s",
-                             msgId, m_identifier.c_str());
+                INST_LOG_ERROR(TAG, "Timeout waiting for response to id=%u on %s (waited %dms)",
+                             msgId, m_identifier.c_str(), timeoutMs);
             }
             return nullptr;
         }
@@ -80,20 +117,23 @@ std::shared_ptr<DTXMessage> DTXChannel::SendMessageSync(
         m_waiters.erase(msgId);
     }
 
-    INST_LOG_DEBUG(TAG, "[%s] Got response for id=%u", m_identifier.c_str(), msgId);
+    INST_LOG_INFO(TAG, "[%s] Got response for id=%u", m_identifier.c_str(), msgId);
     return waiter->response;
 }
 
 void DTXChannel::SendMessageAsync(std::shared_ptr<DTXMessage> message) {
-    if (m_cancelled.load()) return;
+    if (m_cancelled.load()) {
+        INST_LOG_WARN(TAG, "[%s] SendAsync called on cancelled channel", m_identifier.c_str());
+        return;
+    }
 
     uint32_t msgId = NextIdentifier();
     message->SetIdentifier(msgId);
     message->SetChannelCode(m_channelCode);
     message->SetExpectsReply(false);
 
-    INST_LOG_DEBUG(TAG, "[%s] SendAsync id=%u: %s",
-                  m_identifier.c_str(), msgId, message->Dump().c_str());
+    INST_LOG_INFO(TAG, "[%s] SendAsync id=%u, selector=%s",
+                  m_identifier.c_str(), msgId, message->Selector().c_str());
 
     m_connection->SendMessage(message);
 }
@@ -124,16 +164,25 @@ void DTXChannel::Cancel() {
     }
 }
 
+void DTXChannel::SyncIdentifier(uint32_t receivedId) {
+    uint32_t current = m_nextIdentifier.load();
+    if (receivedId >= current) {
+        m_nextIdentifier.store(receivedId + 1);
+        INST_LOG_DEBUG(TAG, "[%s] Synced identifier: %u -> %u (received %u)",
+                      m_identifier.c_str(), current, receivedId + 1, receivedId);
+    }
+}
+
 void DTXChannel::DispatchMessage(std::shared_ptr<DTXMessage> message) {
     if (m_cancelled.load()) return;
 
     uint32_t convIdx = message->ConversationIndex();
 
     // Check if this is a response to a pending synchronous call.
-    // Response messages have ConversationIndex > 0, matching the original Identifier.
+    // Response messages have ConversationIndex > 0 and are keyed by message Identifier (go-ios behavior).
     if (convIdx > 0) {
         std::lock_guard<std::mutex> lock(m_waitersMutex);
-        auto it = m_waiters.find(convIdx);
+        auto it = m_waiters.find(message->Identifier());
         if (it != m_waiters.end()) {
             auto& waiter = it->second;
             std::lock_guard<std::mutex> wlock(waiter->mutex);

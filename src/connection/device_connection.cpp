@@ -130,12 +130,19 @@ std::unique_ptr<DTXConnection> DeviceConnection::CreateInstrumentConnection() {
     IOSProtocol protocol;
     Error err = ServiceConnector::StartInstrumentService(m_device, &service, &protocol);
     if (err != Error::Success || !service) {
-        INST_LOG_ERROR(TAG, "Failed to start instrument service");
+        if (m_protocol == IOSProtocol::RSD) {
+            INST_LOG_ERROR(TAG, "Failed to start instrument service — iOS 17+ requires a tunnel connection (QUIC or remote usbmux proxy)");
+        } else {
+            INST_LOG_ERROR(TAG, "Failed to start instrument service");
+        }
         return nullptr;
     }
 
     std::string serviceName = ServiceConnector::GetInstrumentServiceName(protocol);
     bool sslHandshakeOnly = ServiceConnector::NeedsSSLHandshakeOnly(serviceName);
+
+    INST_LOG_DEBUG(TAG, "Creating DTX connection: service=%s, sslHandshakeOnly=%d, ssl_enabled=%d",
+                  serviceName.c_str(), sslHandshakeOnly ? 1 : 0, service->ssl_enabled ? 1 : 0);
 
     auto conn = DTXConnection::Create(m_device, service, sslHandshakeOnly);
     lockdownd_service_descriptor_free(service);

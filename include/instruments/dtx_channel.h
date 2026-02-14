@@ -42,6 +42,10 @@ public:
     // Cancel channel (stops waiting, closes)
     void Cancel();
 
+    // Synchronize message identifier to avoid collisions
+    // Per pymobiledevice3: update counter when device sends message with higher ID
+    void SyncIdentifier(uint32_t receivedId);
+
     // Channel info
     const std::string& Identifier() const { return m_identifier; }
     int32_t ChannelCode() const { return m_channelCode; }
