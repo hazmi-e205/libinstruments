@@ -26,11 +26,9 @@ public:
     // Factory: create from existing idevice_t (caller retains ownership)
     static std::shared_ptr<DeviceConnection> FromDevice(idevice_t device);
 
-    // Factory: create from remote usbmux proxy (e.g., sonic-gidevice shared port)
-    // Uses idevice_new_remote() to connect to a remote usbmux service.
-    // NOT an RSD tunnel - this is for go-ios/sonic-gidevice remote proxies.
-    static std::shared_ptr<DeviceConnection> FromTunnel(
-        const std::string& tunnelAddress, uint16_t rsdPort);
+    // Factory: create from existing idevice_t and lockdownd_client_t (caller retains ownership)
+    // Reuses the provided lockdown client instead of creating new ones
+    static std::shared_ptr<DeviceConnection> FromDevice(idevice_t device, lockdownd_client_t lockdown);
 
     // Get the underlying idevice_t handle
     idevice_t GetDevice() const { return m_device; }
@@ -62,6 +60,8 @@ private:
 
     idevice_t m_device = nullptr;
     bool m_ownsDevice = false;
+    lockdownd_client_t m_lockdown = nullptr;
+    bool m_ownsLockdown = false;
     IOSProtocol m_protocol = IOSProtocol::Modern;
     std::string m_iosVersion;
     DeviceInfo m_deviceInfo;

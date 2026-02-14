@@ -40,22 +40,32 @@ std::string ServiceConnector::GetTestManagerServiceName(IOSProtocol protocol) {
 
 Error ServiceConnector::StartService(idevice_t device,
                                      const std::vector<std::string>& serviceNames,
-                                     lockdownd_service_descriptor_t* outService) {
+                                     lockdownd_service_descriptor_t* outService,
+                                     lockdownd_client_t lockdown) {
     if (!device || serviceNames.empty() || !outService) {
         return Error::InvalidArgument;
     }
 
-    lockdownd_client_t lockdown = nullptr;
-    lockdownd_error_t lerr = lockdownd_client_new_with_handshake(device, &lockdown, "libinstruments");
-    if (lerr != LOCKDOWN_E_SUCCESS) {
-        INST_LOG_ERROR(TAG, "Failed to create lockdown client: error %d", lerr);
-        return Error::ConnectionFailed;
+    // Use provided lockdown client or create a temporary one
+    lockdownd_client_t temp_lockdown = nullptr;
+    bool owns_lockdown = false;
+
+    if (!lockdown) {
+        // Create temporary lockdown client
+        // NOTE: For remote devices, caller should provide lockdown client
+        lockdownd_error_t lerr = lockdownd_client_new_with_handshake(device, &temp_lockdown, "libinstruments");
+        if (lerr != LOCKDOWN_E_SUCCESS) {
+            INST_LOG_ERROR(TAG, "Failed to create lockdown client: error %d", lerr);
+            return Error::ConnectionFailed;
+        }
+        lockdown = temp_lockdown;
+        owns_lockdown = true;
     }
 
     Error result = Error::ServiceStartFailed;
     for (const auto& name : serviceNames) {
         lockdownd_service_descriptor_t service = nullptr;
-        lerr = lockdownd_start_service(lockdown, name.c_str(), &service);
+        lockdownd_error_t lerr = lockdownd_start_service(lockdown, name.c_str(), &service);
         if (lerr == LOCKDOWN_E_SUCCESS && service) {
             *outService = service;
             INST_LOG_INFO(TAG, "Started service: %s (port=%u, ssl=%d)",
@@ -66,20 +76,24 @@ Error ServiceConnector::StartService(idevice_t device,
         INST_LOG_DEBUG(TAG, "Failed to start service %s: error %d", name.c_str(), lerr);
     }
 
-    lockdownd_client_free(lockdown);
+    if (owns_lockdown) {
+        lockdownd_client_free(temp_lockdown);
+    }
     return result;
 }
 
 Error ServiceConnector::StartService(idevice_t device,
                                      const std::string& serviceName,
-                                     lockdownd_service_descriptor_t* outService) {
-    return StartService(device, std::vector<std::string>{serviceName}, outService);
+                                     lockdownd_service_descriptor_t* outService,
+                                     lockdownd_client_t lockdown) {
+    return StartService(device, std::vector<std::string>{serviceName}, outService, lockdown);
 }
 
 Error ServiceConnector::StartInstrumentService(idevice_t device,
                                                 lockdownd_service_descriptor_t* outService,
-                                                IOSProtocol* outProtocol) {
-    IOSProtocol protocol = DetectProtocol(device);
+                                                IOSProtocol* outProtocol,
+                                                lockdownd_client_t lockdown) {
+    IOSProtocol protocol = DetectProtocol(device, lockdown);
     if (outProtocol) *outProtocol = protocol;
 
     // Try version-specific service names in order
@@ -98,7 +112,7 @@ Error ServiceConnector::StartInstrumentService(idevice_t device,
             break;
     }
 
-    return StartService(device, serviceNames, outService);
+    return StartService(device, serviceNames, outService, lockdown);
 }
 
 Error ServiceConnector::ConnectToService(idevice_t device,
@@ -117,8 +131,8 @@ Error ServiceConnector::ConnectToService(idevice_t device,
     return Error::Success;
 }
 
-IOSProtocol ServiceConnector::DetectProtocol(idevice_t device) {
-    std::string version = GetIOSVersion(device);
+IOSProtocol ServiceConnector::DetectProtocol(idevice_t device, lockdownd_client_t lockdown) {
+    std::string version = GetIOSVersion(device, lockdown);
     if (version.empty()) return IOSProtocol::Modern;
 
     int major = 0, minor = 0, patch = 0;
@@ -129,14 +143,26 @@ IOSProtocol ServiceConnector::DetectProtocol(idevice_t device) {
     return IOSProtocol::Legacy;
 }
 
-std::string ServiceConnector::GetIOSVersion(idevice_t device) {
-    lockdownd_client_t lockdown = nullptr;
-    lockdownd_error_t err = lockdownd_client_new_with_handshake(device, &lockdown, "libinstruments");
-    if (err != LOCKDOWN_E_SUCCESS) return "";
+std::string ServiceConnector::GetIOSVersion(idevice_t device, lockdownd_client_t lockdown) {
+    // Use provided lockdown client or create a temporary one
+    lockdownd_client_t temp_lockdown = nullptr;
+    bool owns_lockdown = false;
+
+    if (!lockdown) {
+        // Create temporary lockdown client
+        // NOTE: For remote devices, caller should provide lockdown client
+        lockdownd_error_t err = lockdownd_client_new_with_handshake(device, &temp_lockdown, "libinstruments");
+        if (err != LOCKDOWN_E_SUCCESS) return "";
+        lockdown = temp_lockdown;
+        owns_lockdown = true;
+    }
 
     plist_t verNode = nullptr;
-    err = lockdownd_get_value(lockdown, nullptr, "ProductVersion", &verNode);
-    lockdownd_client_free(lockdown);
+    lockdownd_error_t err = lockdownd_get_value(lockdown, nullptr, "ProductVersion", &verNode);
+
+    if (owns_lockdown) {
+        lockdownd_client_free(temp_lockdown);
+    }
 
     if (err != LOCKDOWN_E_SUCCESS || !verNode) return "";
 

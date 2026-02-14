@@ -9,6 +9,10 @@ static const char* TAG = "DeviceConnection";
 DeviceConnection::DeviceConnection() = default;
 
 DeviceConnection::~DeviceConnection() {
+    if (m_lockdown && m_ownsLockdown) {
+        lockdownd_client_free(m_lockdown);
+        m_lockdown = nullptr;
+    }
     if (m_device && m_ownsDevice) {
         idevice_free(m_device);
         m_device = nullptr;
@@ -54,30 +58,19 @@ std::shared_ptr<DeviceConnection> DeviceConnection::FromDevice(idevice_t device)
     return conn;
 }
 
-std::shared_ptr<DeviceConnection> DeviceConnection::FromTunnel(
-    const std::string& tunnelAddress, uint16_t rsdPort) {
+std::shared_ptr<DeviceConnection> DeviceConnection::FromDevice(idevice_t device, lockdownd_client_t lockdown) {
+    if (!device) return nullptr;
 
     auto conn = std::shared_ptr<DeviceConnection>(new DeviceConnection());
-    conn->m_isTunnel = true;
-    conn->m_tunnelAddress = tunnelAddress;
-    conn->m_tunnelRsdPort = rsdPort;
-    conn->m_protocol = IOSProtocol::RSD;
+    conn->m_device = device;
+    conn->m_ownsDevice = false;
+    conn->m_lockdown = lockdown;
+    conn->m_ownsLockdown = false;
+    conn->m_iosVersion = ServiceConnector::GetIOSVersion(device, lockdown);
+    conn->m_protocol = ServiceConnector::DetectProtocol(device, lockdown);
 
-    // Connect via remote usbmux proxy (sonic-gidevice / go-ios shared port)
-    // idevice_new_remote() performs a remote usbmux handshake, NOT an RSD tunnel.
-    idevice_error_t err = idevice_new_remote(&conn->m_device,
-                                              tunnelAddress.c_str(), rsdPort);
-    if (err != IDEVICE_E_SUCCESS) {
-        INST_LOG_ERROR(TAG, "Failed to connect to remote usbmux at %s:%u: error %d",
-                      tunnelAddress.c_str(), rsdPort, err);
-        return nullptr;
-    }
-
-    conn->m_ownsDevice = true;
-    conn->m_iosVersion = ServiceConnector::GetIOSVersion(conn->m_device);
-
-    INST_LOG_INFO(TAG, "Connected via remote usbmux %s:%u (iOS %s)",
-                 tunnelAddress.c_str(), rsdPort, conn->m_iosVersion.c_str());
+    INST_LOG_INFO(TAG, "Using existing device with lockdown (iOS %s, protocol=%d)",
+                 conn->m_iosVersion.c_str(), static_cast<int>(conn->m_protocol));
 
     return conn;
 }
@@ -95,8 +88,20 @@ DeviceInfo DeviceConnection::GetDeviceInfo() {
 
     // Get UDID and device name
     if (m_device) {
-        lockdownd_client_t lockdown = nullptr;
-        if (lockdownd_client_new_with_handshake(m_device, &lockdown, "libinstruments") == LOCKDOWN_E_SUCCESS) {
+        lockdownd_client_t lockdown = m_lockdown;
+        bool owns_lockdown = false;
+
+        // Create temporary lockdown if not already provided
+        // NOTE: For remote devices, caller should provide lockdown client
+        if (!lockdown) {
+            lockdownd_error_t lerr = lockdownd_client_new_with_handshake(m_device, &lockdown, "libinstruments");
+            if (lerr != LOCKDOWN_E_SUCCESS) {
+                lockdown = nullptr;
+            }
+            owns_lockdown = true;
+        }
+
+        if (lockdown) {
             // UDID
             char* udid = nullptr;
             idevice_get_udid(m_device, &udid);
@@ -117,7 +122,9 @@ DeviceInfo DeviceConnection::GetDeviceInfo() {
                 plist_free(nameNode);
             }
 
-            lockdownd_client_free(lockdown);
+            if (owns_lockdown) {
+                lockdownd_client_free(lockdown);
+            }
         }
     }
 
@@ -128,7 +135,7 @@ DeviceInfo DeviceConnection::GetDeviceInfo() {
 std::unique_ptr<DTXConnection> DeviceConnection::CreateInstrumentConnection() {
     lockdownd_service_descriptor_t service = nullptr;
     IOSProtocol protocol;
-    Error err = ServiceConnector::StartInstrumentService(m_device, &service, &protocol);
+    Error err = ServiceConnector::StartInstrumentService(m_device, &service, &protocol, m_lockdown);
     if (err != Error::Success || !service) {
         if (m_protocol == IOSProtocol::RSD) {
             INST_LOG_ERROR(TAG, "Failed to start instrument service — iOS 17+ requires a tunnel connection (QUIC or remote usbmux proxy)");
@@ -163,7 +170,7 @@ std::unique_ptr<DTXConnection> DeviceConnection::CreateInstrumentConnection() {
 
 std::unique_ptr<DTXConnection> DeviceConnection::CreateServiceConnection(const std::string& serviceName) {
     lockdownd_service_descriptor_t service = nullptr;
-    Error err = ServiceConnector::StartService(m_device, serviceName, &service);
+    Error err = ServiceConnector::StartService(m_device, serviceName, &service, m_lockdown);
     if (err != Error::Success || !service) {
         return nullptr;
     }
@@ -182,7 +189,7 @@ std::unique_ptr<DTXConnection> DeviceConnection::CreateServiceConnection(const s
 
 Error DeviceConnection::StartService(const std::string& serviceId,
                                      lockdownd_service_descriptor_t* outService) {
-    return ServiceConnector::StartService(m_device, serviceId, outService);
+    return ServiceConnector::StartService(m_device, serviceId, outService, m_lockdown);
 }
 
 } // namespace instruments

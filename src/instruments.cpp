@@ -29,9 +29,8 @@ std::shared_ptr<Instruments> Instruments::Create(idevice_t device) {
     return std::shared_ptr<Instruments>(new Instruments(std::move(connection)));
 }
 
-std::shared_ptr<Instruments> Instruments::CreateWithTunnel(
-    const std::string& tunnelAddr, uint16_t rsdPort) {
-    auto connection = DeviceConnection::FromTunnel(tunnelAddr, rsdPort);
+std::shared_ptr<Instruments> Instruments::Create(idevice_t device, lockdownd_client_t lockdown) {
+    auto connection = DeviceConnection::FromDevice(device, lockdown);
     if (!connection) return nullptr;
     return std::shared_ptr<Instruments>(new Instruments(std::move(connection)));
 }

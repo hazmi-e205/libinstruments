@@ -113,7 +113,28 @@ static CLIArgs ParseArgs(int argc, char* argv[]) {
 
 static std::shared_ptr<Instruments> ConnectDevice(const CLIArgs& args) {
     if (!args.tunnelAddr.empty()) {
-        return Instruments::CreateWithTunnel(args.tunnelAddr, args.tunnelPort);
+        // For remote usbmux: create device with idevice_new_remote, then pass to Instruments
+        idevice_t device = nullptr;
+        idevice_error_t err = idevice_new_remote(&device, args.tunnelAddr.c_str(), args.tunnelPort);
+        if (err != IDEVICE_E_SUCCESS || !device) {
+            fprintf(stderr, "Error: Failed to connect to remote usbmux at %s:%u\n",
+                    args.tunnelAddr.c_str(), args.tunnelPort);
+            return nullptr;
+        }
+
+        // Create lockdown with remote handshake
+        lockdownd_client_t lockdown = nullptr;
+        lockdownd_error_t lerr = lockdownd_client_new_with_handshake_remote(device, &lockdown, "instruments-cli");
+        if (lerr != LOCKDOWN_E_SUCCESS || !lockdown) {
+            fprintf(stderr, "Error: Failed to create lockdown client (error %d)\n", lerr);
+            idevice_free(device);
+            return nullptr;
+        }
+
+        auto inst = Instruments::Create(device, lockdown);
+        // Note: Instruments does NOT take ownership of device/lockdown
+        // They will be freed when the DeviceConnection is destroyed
+        return inst;
     }
     if (!args.udid.empty()) {
         return Instruments::Create(args.udid);
