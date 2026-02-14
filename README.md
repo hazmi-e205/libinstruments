@@ -6,17 +6,17 @@ A standalone, pure C++20 library for communicating with iOS Instruments services
 
 ## Features
 
-### ✅ Tested and Working (iOS 15 via USB)
-- **Process Listing** - Get running processes
-- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl`
+### ✅ Tested and Working (iOS 15)
+- **Process Listing** - Get running processes (tested via USB and remote usbmux)
+- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl` (tested via USB and remote usbmux)
 - **DTX Protocol** - Handshake, message exchange, channel management
+- **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port (tested on iOS 15)
 - **Cross-Platform** - Windows, Linux, macOS
 
 ### 🔄 Implemented But Not Yet Tested
 - **Process Launch/Kill** - Start and terminate processes
 - **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap`
 - **Port Forwarding** - TCP relay between host and device
-- **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port
 - **XCTest Runner** - Execute XCTest bundles with test result callbacks
 - **WebDriverAgent** - Launch WDA with automatic port forwarding (HTTP + MJPEG)
 - **iOS 17+ QUIC Tunnel** - Full tunnel support via picoquic + picotls + lwIP (no root needed)
@@ -227,13 +227,60 @@ if (err != Error::Success) {
 }
 ```
 
-### Remote Usbmux Proxy (🔄 Not Yet Tested)
+### Remote Usbmux Proxy (✅ Tested on iOS 15)
+
+Connect to iOS devices over the network via remote usbmux proxy servers like [sonic-gidevice](https://github.com/SonicCloudOrg/sonic-gidevice) or [go-ios](https://github.com/danielpaulus/go-ios).
+
+**⚠️ Important**: This feature requires **patched libimobiledevice functions** that are NOT in the official repo:
+- `idevice_new_remote()` - Create remote device connection
+- `lockdownd_client_new_with_handshake_remote()` - Remote lockdown handshake
+
+**In iDebugTool**: These functions are patched by the build script automatically. The patches are applied during the build process to enable remote usbmux support.
+
+#### Example: Connect via sonic-gidevice
 
 ```cpp
-// Connect via remote usbmux proxy (e.g., sonic-gidevice / go-ios shared port)
-// This is NOT an RSD tunnel - it's a remote usbmux proxy connection
+// 1. Start sonic-gidevice on the iOS device host (e.g., macOS machine with USB-connected iPhone)
+//    $ gidevice share --port 5555
+
+// 2. Connect from iDebugTool via remote proxy
 auto inst = Instruments::CreateWithTunnel("192.168.1.100", 5555);
+if (!inst) {
+    fprintf(stderr, "Failed to connect via remote proxy\n");
+    return 1;
+}
+
+// 3. Use normally - all features work transparently
+std::vector<ProcessInfo> procs;
+Error err = inst->Process().GetProcessList(procs);
+if (err == Error::Success) {
+    printf("Connected to remote device via %s\n", inst->GetDeviceInfo().name.c_str());
+    for (const auto& p : procs) {
+        printf("  PID: %lld  %s\n", (long long)p.pid, p.name.c_str());
+    }
+}
+
+// FPS monitoring also works via remote proxy
+inst->FPS().Start(1000, [](const FPSData& data) {
+    printf("FPS: %.1f  GPU: %.1f%%\n", data.fps, data.gpuUtilization);
+}, nullptr);
 ```
+
+#### How It Works
+
+1. **sonic-gidevice** runs on the machine with USB-connected iOS device
+2. It exposes a TCP port (e.g., 5555) that speaks the usbmux protocol
+3. `CreateWithTunnel()` connects to this remote port instead of local usbmuxd
+4. All DTX protocol communication happens transparently over the network
+5. **This is NOT an RSD tunnel** - it's a remote usbmux proxy (works on iOS 14-16, possibly iOS 17+ too)
+
+#### Notes
+
+- Tested successfully on **iOS 15** with process listing and FPS monitoring
+- Works with both **sonic-gidevice** (Go) and **go-ios** (Go) proxy servers
+- Network latency may affect real-time monitoring performance
+- Requires the patched libimobiledevice functions (automatically applied in iDebugTool builds)
+- Can be used alongside local USB connections (library auto-detects connection type)
 
 ### iOS 17+ QUIC Tunnel (🔄 Not Yet Tested)
 

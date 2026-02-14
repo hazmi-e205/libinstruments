@@ -200,6 +200,88 @@ picoquic → picotls → OpenSSL 1.1.x
 - `TunnelManager::RegisterExternalTunnel()` works for external tunnel providers
 - External tools: `pymobiledevice3 remote start-tunnel` or `ios tunnel start`
 
+## Remote Usbmux Proxy Support
+
+### Patched libimobiledevice Functions
+
+The remote usbmux proxy feature (✅ tested on iOS 15) requires **custom functions NOT present in official libimobiledevice**:
+
+1. **`idevice_new_remote(idevice_t* device, const char* udid, const char* host, uint16_t port)`**
+   - Creates a device connection to a remote usbmux proxy (e.g., sonic-gidevice, go-ios)
+   - Connects to `host:port` instead of local usbmuxd socket
+   - Returns the same `idevice_t` handle type as local connections
+
+2. **`lockdownd_client_new_with_handshake_remote(idevice_t device, lockdownd_client_t* client, const char* label, const char* host, uint16_t port)`**
+   - Performs lockdown handshake via remote usbmux proxy
+   - Required for establishing services over remote connections
+   - Parallel to `lockdownd_client_new_with_handshake()` but for remote hosts
+
+### Build Script Patching
+
+**In iDebugTool**: These functions are patched by the build script automatically during the build process:
+- Patch location: Applied to libimobiledevice during Premake5/CMake build
+- Implementation: Functions handle TCP connection to remote host instead of local unix socket
+- Transparent: Library API remains the same, only connection establishment differs
+
+### How It Works
+
+```cpp
+// Internal implementation flow (libimobiledevice side, patched):
+idevice_new_remote(&device, udid, "192.168.1.100", 5555)
+  → TCP connect to 192.168.1.100:5555
+  → Send usbmux "connect" plist with UDID
+  → Proxy forwards request to local iOS device
+  → Returns idevice_t handle
+
+lockdownd_client_new_with_handshake_remote(device, &lockdown, "libinstruments", host, port)
+  → Opens lockdown service via remote proxy
+  → Performs SSL/TLS handshake if required
+  → Returns lockdownd_client_t handle
+
+// libinstruments side (transparent usage):
+DeviceConnection::FromTunnel(host, port)
+  → Calls idevice_new_remote() internally
+  → Performs lockdown handshake via remote functions
+  → Returns DeviceConnection instance
+  → All DTX protocol operations work identically to USB connections
+```
+
+### Testing Status
+
+**✅ Verified Working on iOS 15 via sonic-gidevice**:
+- Process listing (`GetProcessList()`) successfully retrieves remote device processes
+- FPS monitoring (`FPSService::Start()`) successfully monitors remote device FPS/GPU
+- DTX protocol handshake and channel management work over network
+- Compatible with sonic-gidevice shared port (tested with default port 5555)
+
+### Usage in iDebugTool
+
+```cpp
+// High-level API (recommended):
+auto inst = Instruments::CreateWithTunnel("192.168.1.100", 5555);
+
+// Low-level API (for advanced use):
+auto conn = DeviceConnection::FromTunnel("192.168.1.100", 5555);
+```
+
+**External proxy setup examples**:
+
+```bash
+# sonic-gidevice (Go-based)
+$ gidevice share --port 5555
+
+# go-ios (Go-based)
+$ ios forward --udid <UDID> --port 5555
+```
+
+### Notes
+
+- This is **NOT an iOS 17+ RSD tunnel** - it's a remote usbmux proxy that works on iOS 14-16 (and possibly other versions)
+- Network latency impacts real-time monitoring performance (FPS, performance metrics)
+- The patched functions are required only for remote connections; local USB connections use standard libimobiledevice
+- Compatible with multiple proxy implementations: sonic-gidevice, go-ios, or custom implementations
+- Can be used alongside local USB connections in the same application
+
 ## Common Patterns
 
 ### Adding a new service
@@ -254,17 +336,17 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 
 ## Testing Status
 
-### ✅ Verified Working on iOS 15 via USB
-- **Process listing** - GetProcessList() successfully retrieves running processes with PID, name, bundle ID
-- **FPS monitoring** - FPSService successfully monitors real-time FPS and GPU utilization via graphics.opengl channel
+### ✅ Verified Working on iOS 15
+- **Process listing** - GetProcessList() successfully retrieves running processes with PID, name, bundle ID (tested via USB and remote proxy)
+- **FPS monitoring** - FPSService successfully monitors real-time FPS and GPU utilization via graphics.opengl channel (tested via USB and remote proxy)
 - **DTX protocol core** - Handshake, message exchange, channel management, callbacks all working
 - **USB connection** - Direct device connection via libimobiledevice
+- **Remote usbmux proxy** - Connection via sonic-gidevice shared port (tested with process listing and FPS monitoring)
 
 ### 🔄 Implemented But Not Yet Tested
 - Process launch/kill operations
 - Performance monitoring via sysmontap (system + process metrics)
 - Port forwarding
-- Remote usbmux proxy connections
 - iOS 17+ QUIC tunnel support (requires INSTRUMENTS_HAS_QUIC build flag)
 - XCTest service
 - WDA service
