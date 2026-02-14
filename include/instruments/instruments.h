@@ -28,8 +28,12 @@ namespace instruments {
 //   // From existing idevice_t
 //   auto inst = Instruments::Create(myDevice);
 //
-//   // From remote usbmux proxy (sonic-gidevice / go-ios shared port)
-//   auto inst = Instruments::CreateWithTunnel("192.168.1.100", 5555);
+//   // From remote usbmux proxy (requires patched libimobiledevice functions)
+//   idevice_t device;
+//   idevice_new_remote(&device, "192.168.1.100", 5555);
+//   lockdownd_client_t lockdown;
+//   lockdownd_client_new_with_handshake_remote(device, &lockdown, "my-app");
+//   auto inst = Instruments::Create(device, lockdown);
 //
 //   // Use services
 //   std::vector<ProcessInfo> procs;

@@ -232,10 +232,18 @@ if (err != Error::Success) {
 Connect to iOS devices over the network via remote usbmux proxy servers like [sonic-gidevice](https://github.com/SonicCloudOrg/sonic-gidevice) or [go-ios](https://github.com/danielpaulus/go-ios).
 
 **⚠️ Important**: This feature requires **patched libimobiledevice functions** that are NOT in the official repo:
-- `idevice_new_remote()` - Create remote device connection
-- `lockdownd_client_new_with_handshake_remote()` - Remote lockdown handshake
 
-**In iDebugTool**: These functions are patched by the build script automatically. The patches are applied during the build process to enable remote usbmux support.
+```c
+// Connect to remote usbmux proxy (e.g., sonic-gidevice at 192.168.1.100:5555)
+idevice_error_t idevice_new_remote(idevice_t *device, const char *ip_address, uint16_t port);
+
+// Perform lockdown handshake via the remote connection
+lockdownd_error_t lockdownd_client_new_with_handshake_remote(idevice_t device,
+                                                               lockdownd_client_t *client,
+                                                               const char *label);
+```
+
+**In iDebugTool**: These functions are patched by the build script automatically during the build process. The patches are located at `Externals/_Patches/libimobiledevice.patch` and applied to the libimobiledevice source.
 
 #### Example: Connect via sonic-gidevice
 
@@ -243,17 +251,36 @@ Connect to iOS devices over the network via remote usbmux proxy servers like [so
 // 1. Start sonic-gidevice on the iOS device host (e.g., macOS machine with USB-connected iPhone)
 //    $ gidevice share --port 5555
 
-// 2. Connect from iDebugTool via remote proxy
-auto inst = Instruments::CreateWithTunnel("192.168.1.100", 5555);
-if (!inst) {
-    fprintf(stderr, "Failed to connect via remote proxy\n");
+// 2. Connect to remote usbmux proxy using patched libimobiledevice functions
+idevice_t device = nullptr;
+idevice_error_t err = idevice_new_remote(&device, "192.168.1.100", 5555);
+if (err != IDEVICE_E_SUCCESS || !device) {
+    fprintf(stderr, "Failed to connect to remote usbmux at 192.168.1.100:5555\n");
     return 1;
 }
 
-// 3. Use normally - all features work transparently
+// 3. Create lockdown client with remote handshake
+lockdownd_client_t lockdown = nullptr;
+lockdownd_error_t lerr = lockdownd_client_new_with_handshake_remote(device, &lockdown, "my-app");
+if (lerr != LOCKDOWN_E_SUCCESS || !lockdown) {
+    fprintf(stderr, "Failed to create lockdown client\n");
+    idevice_free(device);
+    return 1;
+}
+
+// 4. Create Instruments instance (library does NOT take ownership)
+auto inst = Instruments::Create(device, lockdown);
+if (!inst) {
+    fprintf(stderr, "Failed to create Instruments connection\n");
+    lockdownd_client_free(lockdown);
+    idevice_free(device);
+    return 1;
+}
+
+// 5. Use normally - all features work transparently
 std::vector<ProcessInfo> procs;
-Error err = inst->Process().GetProcessList(procs);
-if (err == Error::Success) {
+Error err2 = inst->Process().GetProcessList(procs);
+if (err2 == Error::Success) {
     printf("Connected to remote device via %s\n", inst->GetDeviceInfo().name.c_str());
     for (const auto& p : procs) {
         printf("  PID: %lld  %s\n", (long long)p.pid, p.name.c_str());
@@ -264,15 +291,21 @@ if (err == Error::Success) {
 inst->FPS().Start(1000, [](const FPSData& data) {
     printf("FPS: %.1f  GPU: %.1f%%\n", data.fps, data.gpuUtilization);
 }, nullptr);
+
+// 6. Cleanup (when done with Instruments instance)
+lockdownd_client_free(lockdown);
+idevice_free(device);
 ```
 
 #### How It Works
 
 1. **sonic-gidevice** runs on the machine with USB-connected iOS device
 2. It exposes a TCP port (e.g., 5555) that speaks the usbmux protocol
-3. `CreateWithTunnel()` connects to this remote port instead of local usbmuxd
-4. All DTX protocol communication happens transparently over the network
-5. **This is NOT an RSD tunnel** - it's a remote usbmux proxy (works on iOS 14-16, possibly iOS 17+ too)
+3. `idevice_new_remote()` connects to this remote port instead of local usbmuxd socket
+4. `lockdownd_client_new_with_handshake_remote()` performs lockdown handshake over the remote connection
+5. Pass the device and lockdown handles to `Instruments::Create(device, lockdown)`
+6. All DTX protocol communication happens transparently over the network
+7. **This is NOT an RSD tunnel** - it's a remote usbmux proxy (works on iOS 14-16, possibly iOS 17+ too)
 
 #### Notes
 
@@ -309,7 +342,7 @@ for (const auto& t : tunnels) {
 }
 ```
 
-**Alternative**: Remote usbmux proxy tools (sonic-gidevice, go-ios) work via `Instruments::CreateWithTunnel()` even for iOS 17+ devices.
+**Alternative**: Remote usbmux proxy tools (sonic-gidevice, go-ios) work for iOS 17+ devices by using `idevice_new_remote()` + `lockdownd_client_new_with_handshake_remote()` + `Instruments::Create(device, lockdown)`.
 
 ### CLI Tool
 

@@ -195,8 +195,8 @@ picoquic → picotls → OpenSSL 1.1.x
 
 ### Backward compatibility
 
-- `idevice_new_remote()` still works for remote usbmux proxy (sonic-gidevice / go-ios)
-- `DeviceConnection::FromTunnel()` / `Instruments::CreateWithTunnel()` use remote proxy
+- `idevice_new_remote()` works for remote usbmux proxy (sonic-gidevice / go-ios)
+- Call patched functions, then pass to `Instruments::Create(device, lockdown)`
 - `TunnelManager::RegisterExternalTunnel()` works for external tunnel providers
 - External tools: `pymobiledevice3 remote start-tunnel` or `ios tunnel start`
 
@@ -206,44 +206,50 @@ picoquic → picotls → OpenSSL 1.1.x
 
 The remote usbmux proxy feature (✅ tested on iOS 15) requires **custom functions NOT present in official libimobiledevice**:
 
-1. **`idevice_new_remote(idevice_t* device, const char* udid, const char* host, uint16_t port)`**
+1. **`idevice_error_t idevice_new_remote(idevice_t* device, const char* ip_address, uint16_t port)`**
    - Creates a device connection to a remote usbmux proxy (e.g., sonic-gidevice, go-ios)
-   - Connects to `host:port` instead of local usbmuxd socket
+   - Connects to `ip_address:port` instead of local usbmuxd socket
    - Returns the same `idevice_t` handle type as local connections
+   - Example: `idevice_new_remote(&device, "192.168.1.100", 5555)`
 
-2. **`lockdownd_client_new_with_handshake_remote(idevice_t device, lockdownd_client_t* client, const char* label, const char* host, uint16_t port)`**
-   - Performs lockdown handshake via remote usbmux proxy
-   - Required for establishing services over remote connections
-   - Parallel to `lockdownd_client_new_with_handshake()` but for remote hosts
+2. **`lockdownd_error_t lockdownd_client_new_with_handshake_remote(idevice_t device, lockdownd_client_t* client, const char* label)`**
+   - Performs lockdown handshake via the already-connected remote device
+   - Uses the remote connection established by `idevice_new_remote()`
+   - Parallel to `lockdownd_client_new_with_handshake()` but for remote connections
+   - Does NOT take host/port parameters (uses existing device connection)
 
 ### Build Script Patching
 
 **In iDebugTool**: These functions are patched by the build script automatically during the build process:
-- Patch location: Applied to libimobiledevice during Premake5/CMake build
-- Implementation: Functions handle TCP connection to remote host instead of local unix socket
-- Transparent: Library API remains the same, only connection establishment differs
+- Patch location: `Externals/_Patches/libimobiledevice.patch` applied to libimobiledevice source
+- Implementation: Functions handle TCP connection to remote host instead of local unix/TCP socket
+- Transparent: libimobiledevice API remains the same, only connection establishment differs
+- Applied during build: Premake5/CMake copies and patches libimobiledevice sources
 
 ### How It Works
 
 ```cpp
-// Internal implementation flow (libimobiledevice side, patched):
-idevice_new_remote(&device, udid, "192.168.1.100", 5555)
-  → TCP connect to 192.168.1.100:5555
-  → Send usbmux "connect" plist with UDID
-  → Proxy forwards request to local iOS device
+// Application code (e.g., iDebugTool, instruments-cli):
+idevice_t device = nullptr;
+idevice_new_remote(&device, "192.168.1.100", 5555)
+  → (libimobiledevice patched) TCP connect to 192.168.1.100:5555
+  → (libimobiledevice patched) Handshake with remote usbmux proxy
+  → (proxy) Forwards usbmux protocol to local iOS device over USB
   → Returns idevice_t handle
 
-lockdownd_client_new_with_handshake_remote(device, &lockdown, "libinstruments", host, port)
-  → Opens lockdown service via remote proxy
-  → Performs SSL/TLS handshake if required
+lockdownd_client_t lockdown = nullptr;
+lockdownd_client_new_with_handshake_remote(device, &lockdown, "my-app")
+  → (libimobiledevice patched) Uses existing remote device connection
+  → (libimobiledevice) Opens lockdown service via remote proxy
+  → (libimobiledevice) Performs SSL/TLS handshake if required
   → Returns lockdownd_client_t handle
 
-// libinstruments side (transparent usage):
-DeviceConnection::FromTunnel(host, port)
-  → Calls idevice_new_remote() internally
-  → Performs lockdown handshake via remote functions
-  → Returns DeviceConnection instance
+// Create Instruments instance (libinstruments):
+auto inst = Instruments::Create(device, lockdown)
+  → Creates DeviceConnection from existing device/lockdown handles
+  → Detects iOS version and protocol (pre-14, 14-16, 17+)
   → All DTX protocol operations work identically to USB connections
+  → Library does NOT take ownership of device/lockdown (caller manages lifetime)
 ```
 
 ### Testing Status
@@ -254,14 +260,50 @@ DeviceConnection::FromTunnel(host, port)
 - DTX protocol handshake and channel management work over network
 - Compatible with sonic-gidevice shared port (tested with default port 5555)
 
-### Usage in iDebugTool
+### Usage Example
 
 ```cpp
-// High-level API (recommended):
-auto inst = Instruments::CreateWithTunnel("192.168.1.100", 5555);
+#include <instruments/instruments.h>
+#include <libimobiledevice/libimobiledevice.h>
+#include <libimobiledevice/lockdown.h>
 
-// Low-level API (for advanced use):
-auto conn = DeviceConnection::FromTunnel("192.168.1.100", 5555);
+// Connect to remote usbmux proxy
+idevice_t device = nullptr;
+idevice_error_t err = idevice_new_remote(&device, "192.168.1.100", 5555);
+if (err != IDEVICE_E_SUCCESS) {
+    fprintf(stderr, "Failed to connect to remote usbmux\n");
+    return 1;
+}
+
+// Perform lockdown handshake
+lockdownd_client_t lockdown = nullptr;
+lockdownd_error_t lerr = lockdownd_client_new_with_handshake_remote(device, &lockdown, "my-app");
+if (lerr != LOCKDOWN_E_SUCCESS) {
+    fprintf(stderr, "Failed lockdown handshake\n");
+    idevice_free(device);
+    return 1;
+}
+
+// Create Instruments instance
+auto inst = instruments::Instruments::Create(device, lockdown);
+if (!inst) {
+    fprintf(stderr, "Failed to create Instruments\n");
+    lockdownd_client_free(lockdown);
+    idevice_free(device);
+    return 1;
+}
+
+// Use services (same API as local USB)
+std::vector<instruments::ProcessInfo> procs;
+inst->Process().GetProcessList(procs);
+for (const auto& p : procs) {
+    printf("PID: %lld %s\n", p.pid, p.name.c_str());
+}
+
+// Cleanup when done
+inst.reset();  // Destroy Instruments instance first
+lockdownd_client_free(lockdown);
+idevice_free(device);
 ```
 
 **External proxy setup examples**:
