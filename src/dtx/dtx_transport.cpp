@@ -85,7 +85,7 @@ bool DTXTransport::ReadExact(uint8_t* buffer, size_t length) {
             reinterpret_cast<char*>(buffer + totalRead),
             static_cast<uint32_t>(length - totalRead),
             &bytesRead,
-            30000 // 30 second timeout
+            1000 // 1 second timeout to allow fast shutdown
         );
 
         if (bytesRead > 0) {

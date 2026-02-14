@@ -168,6 +168,19 @@ void DTXConnection::SetGlobalMessageHandler(DTXChannel::MessageHandler handler) 
     m_globalHandler = std::move(handler);
 }
 
+void DTXConnection::AddGlobalMessageHandler(DTXChannel::MessageHandler handler) {
+    std::lock_guard<std::mutex> lock(m_globalHandlerMutex);
+    if (!m_globalHandler) {
+        m_globalHandler = std::move(handler);
+        return;
+    }
+    auto existing = m_globalHandler;
+    m_globalHandler = [existing, handler](std::shared_ptr<DTXMessage> msg) {
+        if (existing) existing(msg);
+        if (handler) handler(msg);
+    };
+}
+
 Error DTXConnection::SendMessage(std::shared_ptr<DTXMessage> message) {
     if (!m_connected.load() || !m_transport) {
         return Error::ConnectionFailed;
@@ -175,9 +188,9 @@ Error DTXConnection::SendMessage(std::shared_ptr<DTXMessage> message) {
     return m_transport->SendMessage(message);
 }
 
-void DTXConnection::SendAck(uint32_t identifier, uint32_t channelCode) {
+void DTXConnection::SendAck(uint32_t identifier, uint32_t channelCode, uint32_t conversationIndex) {
     INST_LOG_INFO(TAG, "Creating ACK message for id=%u, ch=%u", identifier, channelCode);
-    auto ack = DTXMessage::CreateAck(identifier, channelCode);
+    auto ack = DTXMessage::CreateAck(identifier, channelCode, conversationIndex);
     Error err = SendMessage(ack);
     if (err == Error::Success) {
         INST_LOG_INFO(TAG, "ACK sent successfully");
@@ -395,7 +408,7 @@ void DTXConnection::DispatchMessage(std::shared_ptr<DTXMessage> message) {
         message->ExpectsReply()) {
         INST_LOG_INFO(TAG, "Sending ACK for message id=%u",
                       message->Identifier());
-        SendAck(message->Identifier(), message->ChannelCode());
+        SendAck(message->Identifier(), message->ChannelCode(), message->ConversationIndex());
     } else {
         INST_LOG_INFO(TAG, "NOT sending ACK (ExpectsReply=%d, MsgType=%u, ConvIdx=%u)",
                       message->ExpectsReply() ? 1 : 0,

@@ -49,7 +49,7 @@ public:
     // Factory methods
     static std::shared_ptr<DTXMessage> Create();
     static std::shared_ptr<DTXMessage> CreateWithSelector(const std::string& selector);
-    static std::shared_ptr<DTXMessage> CreateAck(uint32_t identifier, uint32_t channelCode);
+    static std::shared_ptr<DTXMessage> CreateAck(uint32_t identifier, uint32_t channelCode, uint32_t conversationIndex);
 
     // Header fields
     uint32_t Identifier() const { return m_header.identifier; }

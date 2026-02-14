@@ -38,6 +38,8 @@ private:
     std::unique_ptr<DTXConnection> m_dtxConnection;
     std::shared_ptr<DTXChannel> m_channel;
     std::atomic<bool> m_running{false};
+    std::atomic<uint32_t> m_sampleIntervalMs{0};
+    std::atomic<int64_t> m_lastCallbackMs{0};
 };
 
 } // namespace instruments

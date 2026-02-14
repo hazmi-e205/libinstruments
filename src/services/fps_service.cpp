@@ -1,6 +1,7 @@
 #include "../../include/instruments/fps_service.h"
 #include "../nskeyedarchiver/nsobject.h"
 #include "../util/log.h"
+#include <chrono>
 
 namespace instruments {
 
@@ -21,6 +22,8 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
     if (m_running.load()) {
         Stop();
     }
+    m_sampleIntervalMs.store(sampleIntervalMs);
+    m_lastCallbackMs.store(0);
 
     // Create persistent DTX connection
     m_dtxConnection = m_connection->CreateInstrumentConnection();
@@ -50,9 +53,7 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
     rateMsg->AppendAuxiliary(NSObject(rate));
     m_channel->SendMessageSync(rateMsg);
 
-    // Set message handler for streaming FPS data
-    m_channel->SetMessageHandler([this, callback, errorCb](
-        std::shared_ptr<DTXMessage> msg) {
+    auto parseFpsMessage = [this, callback, errorCb](std::shared_ptr<DTXMessage> msg) {
         if (!m_running.load()) return;
 
         auto payload = msg->PayloadObject();
@@ -83,9 +84,34 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
         }
 
         if (callback) {
+            const uint32_t intervalMs = m_sampleIntervalMs.load();
+            if (intervalMs > 0) {
+                const auto now = std::chrono::steady_clock::now();
+                const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now.time_since_epoch()).count();
+                const auto lastMs = m_lastCallbackMs.load();
+                if (lastMs != 0 && (nowMs - lastMs) < static_cast<int64_t>(intervalMs)) {
+                    return;
+                }
+                m_lastCallbackMs.store(nowMs);
+            }
             callback(fpsData);
         }
-    });
+    };
+
+    // Set message handler for streaming FPS data (channel messages)
+    m_channel->SetMessageHandler(parseFpsMessage);
+
+    // Some FPS updates arrive on the default (-1 / 0xFFFFFFFF) channel.
+    // Attach a global handler for those messages.
+    if (m_dtxConnection) {
+        m_dtxConnection->AddGlobalMessageHandler([parseFpsMessage](std::shared_ptr<DTXMessage> msg) {
+            if (!msg) return;
+            if (static_cast<int32_t>(msg->ChannelCode()) == -1) {
+                parseFpsMessage(msg);
+            }
+        });
+    }
 
     // Start sampling
     auto startMsg = DTXMessage::CreateWithSelector("startSamplingAtTimeInterval:");
@@ -102,6 +128,7 @@ void FPSService::Stop() {
     if (!m_running.exchange(false)) return;
 
     INST_LOG_INFO(TAG, "Stopping FPS monitoring");
+    m_lastCallbackMs.store(0);
 
     if (m_channel) {
         auto stopMsg = DTXMessage::CreateWithSelector("stopSampling");

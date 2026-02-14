@@ -58,12 +58,13 @@ std::shared_ptr<DTXMessage> DTXMessage::CreateWithSelector(const std::string& se
     return msg;
 }
 
-std::shared_ptr<DTXMessage> DTXMessage::CreateAck(uint32_t identifier, uint32_t channelCode) {
+std::shared_ptr<DTXMessage> DTXMessage::CreateAck(uint32_t identifier, uint32_t channelCode, uint32_t conversationIndex) {
     auto msg = std::make_shared<DTXMessage>();
     msg->SetMessageType(DTXMessageType::Ack);
     msg->SetIdentifier(identifier);
     msg->SetChannelCode(channelCode);
-    msg->SetConversationIndex(identifier);
+    // Per go-ios: ACK uses ConversationIndex + 1
+    msg->SetConversationIndex(conversationIndex + 1);
     msg->SetExpectsReply(false);
     return msg;
 }
@@ -134,8 +135,9 @@ std::vector<std::vector<uint8_t>> DTXMessage::Encode() const {
     size_t payloadLen = m_payload.size();
     size_t auxLenWithHeader = auxLen > 0 ? auxLen + DTXProtocol::PayloadHeaderLength : 0;
     size_t totalPayloadLen = auxLenWithHeader + payloadLen;
+    // ACK messages still include a 16-byte payload header (go-ios behavior)
     bool hasPayload = (totalPayloadLen > 0 ||
-                       MessageType() != DTXMessageType::Ack);
+                       MessageType() == DTXMessageType::Ack);
 
     std::vector<uint8_t> payloadSection;
     if (hasPayload) {

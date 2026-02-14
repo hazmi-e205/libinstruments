@@ -2,18 +2,18 @@
 
 A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB/network, iOS 17+ via QUIC tunnel (picoquic + picotls + lwIP), and remote usbmux proxy connections (sonic-gidevice / go-ios).
 
-**Status**: ✅ DTX protocol working - process listing tested on iOS 15 via USB. Designed for iOS 14-17+.
+**Status**: ✅ DTX protocol working - process listing and FPS monitoring tested on iOS 15 via USB. Designed for iOS 14-17+.
 
 ## Features
 
-### ✅ Tested and Working
-- **Process Listing** - Get running processes via USB connection (iOS 15)
-- **DTX Protocol** - Handshake, message exchange, channel management (iOS 15)
+### ✅ Tested and Working (iOS 15 via USB)
+- **Process Listing** - Get running processes
+- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl`
+- **DTX Protocol** - Handshake, message exchange, channel management
 - **Cross-Platform** - Windows, Linux, macOS
 
 ### 🔄 Implemented But Not Yet Tested
 - **Process Launch/Kill** - Start and terminate processes
-- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl`
 - **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap`
 - **Port Forwarding** - TCP relay between host and device
 - **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port
@@ -123,7 +123,7 @@ if (err == Error::Success) {
 err = inst->Process().KillProcess(pid);
 ```
 
-#### FPS Monitoring (🔄 Not Yet Tested)
+#### FPS Monitoring (✅ Tested on iOS 15 via USB)
 
 ```cpp
 // Start FPS monitoring (1000ms interval)
@@ -412,4 +412,8 @@ When modifying this library:
 
 ## License
 
-Part of the iDebugTool project.
+GNU Affero General Public License v3.0 (AGPL-3.0)
+
+This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
+
+See the [LICENSE](LICENSE) file for full details.

@@ -4,7 +4,7 @@
 
 `libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
 
-**Status**: ✅ DTX protocol working and tested with process listing on iOS 15 via USB (as of Feb 2026). Designed to support iOS 14-17+.
+**Status**: ✅ DTX protocol working and tested with process listing and FPS monitoring on iOS 15 via USB (as of Feb 2026). Designed to support iOS 14-17+.
 
 ## Code Style
 
@@ -68,6 +68,7 @@ All located in sibling directories under `Externals/`:
   - Old format used 4x uint32 fields, causing device to misparse and close connection
 - **Types**: null=0x0A, string=0x01, bytearray=0x02, uint32=0x03, int64=0x06
   - **Type 0x06 is UNSIGNED uint64_t**, not signed int64_t (per pymobiledevice3 Int64ul)
+  - NSObject supports both Int64 and UInt64 types, encoder handles both correctly
 
 ### Handshake Protocol (CRITICAL!)
 
@@ -76,12 +77,15 @@ Client MUST send `_notifyOfPublishedCapabilities:` immediately after connection 
 **Critical requirements**:
 1. **ExpectsReply must be FALSE**: Bidirectional exchange, not request-response
    - If sent with ExpectsReply=true, device expects ACK protocol that breaks the handshake flow
-2. **Must wait for device response**: Use SendMessageSync() to block until device responds (5 sec timeout)
+   - Use SendMessageAsync() to send handshake, then wait for device response with condition variable
+2. **Must wait for device response**: Wait for device's `_notifyOfPublishedCapabilities:` message (5 sec timeout)
    - Device sends its own `_notifyOfPublishedCapabilities:` message back
    - Matches pymobiledevice3: send_message() then recv_plist() blocks until device responds
-3. **Capability values**: Must use signed int64_t, NOT uint64_t
-   - Per pymobiledevice3: plain Python ints (0, 1, 2) get encoded as signed integers
-   - DTXBlockCompression: int64_t(2), DTXConnection: int64_t(1)
+   - Implementation uses std::condition_variable with predicate checking m_handshakeReceived flag
+3. **Capability values**: Must use uint64_t type in NSObject
+   - DTXBlockCompression: NSObject(static_cast<uint64_t>(2)) to match go-ios/sonic-gidevice
+   - DTXConnection: NSObject(static_cast<uint64_t>(1))
+   - These get encoded as PrimitiveDictionary type 0x06 (uint64) but represent valid uint values
 4. **Message identifier synchronization (MOST IMPORTANT!)**: Must update identifier counter when device sends message
    - Per pymobiledevice3 lines 512-513: if device sends id=N, next client message must use id>=N+1
    - Without sync: client reuses device's identifier → device closes connection immediately
@@ -251,13 +255,13 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 ## Testing Status
 
 ### ✅ Verified Working on iOS 15 via USB
-- **Process listing** - GetProcessList() successfully retrieves running processes
-- **DTX protocol core** - Handshake, message exchange, channel management all working
+- **Process listing** - GetProcessList() successfully retrieves running processes with PID, name, bundle ID
+- **FPS monitoring** - FPSService successfully monitors real-time FPS and GPU utilization via graphics.opengl channel
+- **DTX protocol core** - Handshake, message exchange, channel management, callbacks all working
 - **USB connection** - Direct device connection via libimobiledevice
 
 ### 🔄 Implemented But Not Yet Tested
 - Process launch/kill operations
-- FPS monitoring via graphics.opengl
 - Performance monitoring via sysmontap (system + process metrics)
 - Port forwarding
 - Remote usbmux proxy connections
@@ -315,21 +319,21 @@ This library was successfully implemented after fixing several critical protocol
 
 **Reference**: pymobiledevice3 DvtSecureSocketProxyService handshake implementation.
 
-### Problem 6: Type 0x06 Signed vs Unsigned
+### Problem 6: Capability Value Types
 **Symptom**: Capability values in handshake misinterpreted by device, causing protocol errors.
 
-**Root Cause**: Type 0x06 in PrimitiveDictionary is UNSIGNED uint64_t (per pymobiledevice3 Int64ul), but we were using signed int64_t for both encoding and decoding. However, capability VALUES must be signed integers (per Python int encoding).
+**Root Cause**: Capability values must be created as NSObject(uint64_t) to match go-ios/sonic-gidevice encoding. PrimitiveDictionary type 0x06 is UNSIGNED uint64_t (per pymobiledevice3 Int64ul).
 
-**Fix**: Use uint64_t for type 0x06 read/write operations, but use int64_t for capability values in handshake. This distinction is critical.
+**Fix**: Create capability NSObjects with explicit uint64_t: `NSObject(static_cast<uint64_t>(2))` for DTXBlockCompression, `NSObject(static_cast<uint64_t>(1))` for DTXConnection. The PrimitiveDictionary encoder uses WriteLE64() with uint64_t.
 
-**Reference**: pymobiledevice3 message_aux_t_struct line 87 (Int64ul = unsigned).
+**Reference**: go-ios capability encoding, pymobiledevice3 message_aux_t_struct line 87 (Int64ul = unsigned).
 
 ### Key Takeaways
 1. **Always sync message identifiers** when device sends unsolicited messages
 2. **PrimitiveDictionary format is strict** - must include 0x0A marker before each entry
 3. **Handshake is bidirectional** - not request-response, so ExpectsReply=false
 4. **Payload messageType includes 0x1000 bit** when expecting replies
-5. **Type encoding vs value semantics** - type 0x06 is uint64_t, but capability values are signed
+5. **Capability values** - use NSObject(uint64_t) for capability values in handshake
 
 ## Things to Watch Out For
 

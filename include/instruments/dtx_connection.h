@@ -66,6 +66,8 @@ public:
 
     // Set handler for messages on unregistered channels
     void SetGlobalMessageHandler(DTXChannel::MessageHandler handler);
+    // Add an additional handler for messages on unregistered channels
+    void AddGlobalMessageHandler(DTXChannel::MessageHandler handler);
 
     // Send a message via the transport (called by DTXChannel)
     Error SendMessage(std::shared_ptr<DTXMessage> message);
@@ -83,7 +85,7 @@ private:
     void DispatchMessage(std::shared_ptr<DTXMessage> message);
 
     // Send an ACK for a received message
-    void SendAck(uint32_t identifier, uint32_t channelCode);
+    void SendAck(uint32_t identifier, uint32_t channelCode, uint32_t conversationIndex);
 
     std::unique_ptr<DTXTransport> m_transport;
     std::atomic<bool> m_connected{false};
