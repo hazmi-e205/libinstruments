@@ -104,7 +104,7 @@ Error PerformanceService::Start(const PerfConfig& config,
     // Build config dictionary
     NSObject::DictType configDict;
     configDict["ur"] = NSObject(static_cast<int64_t>(actualConfig.sampleIntervalMs));
-    configDict["bm"] = NSObject(static_cast<int32_t>(0));
+    configDict["bm"] = NSObject(static_cast<int32_t>(actualConfig.bm));
     configDict["cpuUsage"] = NSObject(true);
     configDict["physFootprint"] = NSObject(true);
     configDict["sampleInterval"] = NSObject(static_cast<int64_t>(
@@ -133,6 +133,13 @@ Error PerformanceService::Start(const PerfConfig& config,
     NSObject configObj(std::move(configDict));
     configObj.SetClassName("NSMutableDictionary");
     configObj.SetClassHierarchy({"NSMutableDictionary", "NSDictionary", "NSObject"});
+
+    INST_LOG_INFO(TAG, "Sysmontap setConfig bm=%u ur=%u sampleIntervalNs=%lld sysAttrs=%zu procAttrs=%zu",
+                  actualConfig.bm,
+                  actualConfig.sampleIntervalMs,
+                  static_cast<long long>(actualConfig.sampleIntervalMs * 1000000LL),
+                  actualConfig.systemAttributes.size(),
+                  actualConfig.processAttributes.size());
 
     // Store process attribute order for array-format parsing
     m_processAttributes = actualConfig.processAttributes;
@@ -354,6 +361,13 @@ void PerformanceService::ParseSysmontapMessage(const NSObject& data,
             }
 
             if (!processMetrics.empty()) {
+                static bool s_firstProcLogged = false;
+                if (!s_firstProcLogged) {
+                    s_firstProcLogged = true;
+                    INST_LOG_INFO(TAG, "Sysmontap process data detected (dict format), count=%zu, firstPid=%lld",
+                                  processMetrics.size(),
+                                  static_cast<long long>(processMetrics.front().pid));
+                }
                 processCb(processMetrics);
             }
         }
@@ -432,6 +446,13 @@ void PerformanceService::ParseSysmontapMessage(const NSObject& data,
                     }
 
                     if (!processMetrics.empty()) {
+                        static bool s_firstProcLogged = false;
+                        if (!s_firstProcLogged) {
+                            s_firstProcLogged = true;
+                            INST_LOG_INFO(TAG, "Sysmontap process data detected (array format), count=%zu, firstPid=%lld",
+                                          processMetrics.size(),
+                                          static_cast<long long>(processMetrics.front().pid));
+                        }
                         processCb(processMetrics);
                     }
                 }

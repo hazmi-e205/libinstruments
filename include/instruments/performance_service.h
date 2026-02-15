@@ -15,6 +15,7 @@ struct PerfConfig {
     uint32_t sampleIntervalMs = 1000;          // Sampling interval in ms
     std::vector<std::string> systemAttributes;  // Auto-populated if empty
     std::vector<std::string> processAttributes; // Auto-populated if empty
+    uint32_t bm = 3;                           // Sysmontap bitmask (3 = system + process)
 };
 
 // PerformanceService - monitors system and per-process performance metrics
