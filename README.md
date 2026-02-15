@@ -491,6 +491,7 @@ When modifying this library:
 - **[pymobiledevice3](https://github.com/doronz88/pymobiledevice3)** - Python reference for DTX protocol and iOS communication
 - **[go-ios](https://github.com/danielpaulus/go-ios)** - Go reference implementation (primary DTX reference)
 - **[sonic-gidevice](https://github.com/SonicCloudOrg/sonic-gidevice)** - Go implementation with remote proxy support
+- **[iosif](https://github.com/dryark/iosif)** - C implementation reference for DTX protocol details (bytearr.c, dtxpayload__new)
 
 ## License
 

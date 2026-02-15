@@ -531,6 +531,11 @@ Ported from and validated against multiple iOS tools:
   - DTX protocol implementation and message handling
   - Alternative Go-based approach to iOS device communication
 
+- **[iosif](https://github.com/dryark/iosif)** (C) - Low-level DTX protocol implementation reference:
+  - Critical format details: `bytearr.c` (PrimitiveDictionary auxiliary header format)
+  - Payload header encoding: `dtxpayload__new` (messageType 0x1000 bit handling)
+  - Binary protocol validation and edge case handling
+
 Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code references and old implementation on `devicebridge_instrument.cpp`.
 
 ## Testing Status
@@ -583,7 +588,7 @@ This library was successfully implemented after fixing several critical protocol
 
 **Fix**: Changed header format to `[uint64 magic=0x1F0][uint64 length]`.
 
-**Reference**: iosif bytearr.c auxiliary encoding.
+**Reference**: [iosif](https://github.com/dryark/iosif) `bytearr.c` auxiliary encoding implementation.
 
 ### Problem 4: Missing 0x1000 Bit in Payload MessageType
 **Symptom**: Device doesn't respond to messages that should get replies.
@@ -592,7 +597,7 @@ This library was successfully implemented after fixing several critical protocol
 
 **Fix**: Set messageType = baseType | (expectsReply ? 0x1000 : 0). E.g., MethodInvocation with reply is 0x1002, without is 0x0002.
 
-**Reference**: iosif dtxpayload__new implementation.
+**Reference**: [iosif](https://github.com/dryark/iosif) `dtxpayload__new` implementation.
 
 ### Problem 5: Handshake Message with ExpectsReply=true
 **Symptom**: Device closes connection immediately after handshake exchange.
