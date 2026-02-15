@@ -63,6 +63,7 @@ std::shared_ptr<DTXMessage> DTXChannel::SendMessageSync(
         }
 
         // Dump full encoded message for byte-level comparison with reference fixtures
+#if defined(INSTRUMENTS_ENABLE_LOGGING)
         auto frames = message->Encode();
         if (!frames.empty()) {
             const char* dumpPath = "request_channel_last.bin";
@@ -78,6 +79,7 @@ std::shared_ptr<DTXMessage> DTXChannel::SendMessageSync(
                               m_identifier.c_str(), dumpPath);
             }
         }
+#endif
     }
 
     // Send the message
