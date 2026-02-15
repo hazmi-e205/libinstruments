@@ -2,20 +2,22 @@
 
 A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB/network, iOS 17+ via QUIC tunnel (picoquic + picotls + lwIP), and remote usbmux proxy connections (sonic-gidevice / go-ios).
 
-**Status**: ✅ DTX protocol working - process listing and FPS monitoring tested on iOS 15 via USB. Designed for iOS 14-17+.
+**Status**: ✅ DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on iOS 15 via USB. Designed for iOS 14-17+.
 
 ## Features
 
 ### ✅ Tested and Working (iOS 15)
 - **Process Listing** - Get running processes (tested via USB and remote usbmux)
 - **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl` (tested via USB and remote usbmux)
-- **DTX Protocol** - Handshake, message exchange, channel management
+- **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap` (tested via USB on iOS 15)
+  - Supports multiple iOS data formats: dict-based (Processes key), nested dict (System.processes/ProcessByPid), and array-packed layouts
+  - Handles messages on both dedicated channel and global channel (-1)
+- **DTX Protocol** - Handshake, message exchange, channel management, global message routing
 - **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port (tested on iOS 15)
 - **Cross-Platform** - Windows, Linux, macOS
 
 ### 🔄 Implemented But Not Yet Tested
 - **Process Launch/Kill** - Start and terminate processes
-- **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap`
 - **Port Forwarding** - TCP relay between host and device
 - **XCTest Runner** - Execute XCTest bundles with test result callbacks
 - **WebDriverAgent** - Launch WDA with automatic port forwarding (HTTP + MJPEG)
@@ -142,16 +144,16 @@ inst->FPS().Start(1000,
 inst->FPS().Stop();
 ```
 
-#### Performance Monitoring (🔄 Not Yet Tested)
+#### Performance Monitoring (✅ Tested on iOS 15 via USB)
 
 ```cpp
 // Configure performance monitoring
 PerfConfig config;
 config.sampleIntervalMs = 1000;  // Sample every 1 second
-config.cpuUsage = true;
-config.memoryUsage = true;
-config.diskActivity = true;
-config.networkActivity = true;
+// System and process attributes will be auto-populated if not specified
+// Alternatively, you can specify custom attributes:
+// config.systemAttributes = {"cpu_total_load", "memUsed", "diskBytesRead"};
+// config.processAttributes = {"pid", "name", "cpuUsage", "physFootprint"};
 
 // Start monitoring
 inst->Performance().Start(config,

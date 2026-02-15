@@ -4,7 +4,7 @@
 
 `libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
 
-**Status**: ✅ DTX protocol working and tested with process listing and FPS monitoring on iOS 15 via USB (as of Feb 2026). Designed to support iOS 14-17+.
+**Status**: ✅ DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on iOS 15 via USB (as of Feb 2026). Designed to support iOS 14-17+.
 
 ## Code Style
 
@@ -139,6 +139,22 @@ testmanagerd:  com.apple.instruments.server.services.testmanagerd
 - Monitoring callbacks (FPS, Perf) fire on the receive thread
 - Port forwarder runs acceptor + relay threads
 - Stop via `std::atomic<bool>` flags
+
+### Global Message Handler Chain
+
+`DTXConnection::AddGlobalMessageHandler()` allows multiple handlers to be registered. Each call wraps the previous handler in a lambda chain:
+
+```cpp
+void AddGlobalMessageHandler(MessageHandler handler) {
+    auto existing = m_globalHandler;
+    m_globalHandler = [existing, handler](auto msg) {
+        if (existing) existing(msg);  // Call previous handler
+        if (handler) handler(msg);    // Call new handler
+    };
+}
+```
+
+This enables multiple services to coexist on the same connection, each filtering for their specific channel codes.
 
 ## iOS 17+ QUIC Tunnel + RSD
 
@@ -324,6 +340,147 @@ $ ios forward --udid <UDID> --port 5555
 - Compatible with multiple proxy implementations: sonic-gidevice, go-ios, or custom implementations
 - Can be used alongside local USB connections in the same application
 
+## Service Implementation Patterns (iOS 15 Tested)
+
+### Global Message Handler Pattern
+
+Many DTX services send messages on BOTH their dedicated channel AND the global/default channel (channel code -1 or 0xFFFFFFFF). This was discovered during iOS 15 testing with FPS and Performance services.
+
+**Critical requirement**: Services MUST register handlers for both:
+1. Their dedicated channel via `channel->SetMessageHandler()`
+2. The global channel via `dtxConnection->AddGlobalMessageHandler()`
+
+**Example pattern**:
+```cpp
+// Create shared lambda for parsing messages
+auto parseMessage = [this, callback](std::shared_ptr<DTXMessage> msg) {
+    if (!m_running.load()) return;
+    if (!msg) return;
+
+    auto payload = msg->PayloadObject();
+    if (payload) {
+        ParsePayload(*payload, callback);
+    }
+};
+
+// Register on dedicated channel
+m_channel->SetMessageHandler(parseMessage);
+
+// Register on global channel for channel-code=-1 messages
+if (m_dtxConnection) {
+    m_dtxConnection->AddGlobalMessageHandler([parseMessage](std::shared_ptr<DTXMessage> msg) {
+        if (!msg) return;
+        if (static_cast<int32_t>(msg->ChannelCode()) == -1) {
+            parseMessage(msg);
+        }
+    });
+}
+```
+
+### Early Message Arrival
+
+Some services (like sysmontap) may send data messages BEFORE the "start" method returns. This requires:
+1. Set `m_running = true` BEFORE sending the start command
+2. Register message handlers BEFORE sending start
+3. Only then send the start command
+
+**Example**:
+```cpp
+// 1. Configure and send setConfig first
+m_channel->SendMessageSync(setConfigMsg);
+
+// 2. Set running flag and register handlers
+m_running.store(true);
+m_channel->SetMessageHandler(parseMessage);
+m_dtxConnection->AddGlobalMessageHandler(globalHandler);
+
+// 3. NOW send start (messages may arrive immediately)
+m_channel->SendMessageSync(startMsg);
+```
+
+### Performance Service (sysmontap) Payload Formats
+
+iOS 15 sysmontap service returns data in multiple possible formats. The parser must handle ALL of these:
+
+**Format 1: Top-level Processes dict** (dict-based, keyed by PID string)
+```json
+{
+  "SystemCPUUsage": {...},
+  "Processes": {
+    "123": ["launchd", 0.1, 12345678, ...],  // array of values
+    "456": {"pid": 456, "name": "foo", "cpuUsage": 1.2, ...}  // or dict
+  }
+}
+```
+
+**Format 2: Nested System dict** (dict-based, various key names)
+```json
+{
+  "System": {
+    "Processes": {...},          // or
+    "processes": {...},          // or
+    "ProcessByPid": {...},       // or
+    "processByPid": {...}
+  }
+}
+```
+
+**Format 3: Array-packed layout** (most efficient, used on some iOS versions)
+```json
+{
+  "SystemAttributes": ["cpu_total_load", "memUsed", ...],
+  "ProcessesAttributes": ["pid", "name", "cpuUsage", "physFootprint", ...],
+  "System": [
+    // System values (systemAttributes.length items)
+    45.2, 1234567890, ...,
+    // Process 1 values (processAttributes.length items)
+    123, "launchd", 0.1, 12345678, ...,
+    // Process 2 values
+    456, "foo", 1.2, 23456789, ...
+  ]
+}
+```
+
+**Implementation**: `ParseSysmontapMessage()` in performance_service.cpp handles all three formats with fallback logic.
+
+### FPS Service Rate Limiting
+
+The FPS service receives messages at a high frequency (often faster than requested). To honor the `sampleIntervalMs` parameter, the service implements rate limiting:
+
+```cpp
+std::atomic<uint32_t> m_sampleIntervalMs{0};
+std::atomic<int64_t> m_lastCallbackMs{0};
+
+// In message handler:
+const uint32_t intervalMs = m_sampleIntervalMs.load();
+if (intervalMs > 0) {
+    const auto now = std::chrono::steady_clock::now();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now.time_since_epoch()).count();
+    const auto lastMs = m_lastCallbackMs.load();
+    if (lastMs != 0 && (nowMs - lastMs) < static_cast<int64_t>(intervalMs)) {
+        return;  // Skip this callback, too soon
+    }
+    m_lastCallbackMs.store(nowMs);
+}
+callback(fpsData);
+```
+
+### Attribute Auto-Population
+
+Performance service auto-populates system and process attributes if not specified in config:
+```cpp
+if (config.systemAttributes.empty()) {
+    GetSystemAttributes(config.systemAttributes);  // Query device
+    if (config.systemAttributes.empty()) {
+        // Fallback to defaults if query fails
+        config.systemAttributes = {"cpu_total_load", "memUsed", ...};
+    }
+}
+```
+
+This ensures the service works out-of-the-box while allowing customization.
+
 ## Common Patterns
 
 ### Adding a new service
@@ -380,14 +537,17 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 
 ### ✅ Verified Working on iOS 15
 - **Process listing** - GetProcessList() successfully retrieves running processes with PID, name, bundle ID (tested via USB and remote proxy)
-- **FPS monitoring** - FPSService successfully monitors real-time FPS and GPU utilization via graphics.opengl channel (tested via USB and remote proxy)
-- **DTX protocol core** - Handshake, message exchange, channel management, callbacks all working
+- **FPS monitoring** - FPSService successfully monitors real-time FPS and GPU utilization via graphics.opengl channel with rate limiting (tested via USB and remote proxy)
+- **Performance monitoring** - PerformanceService successfully monitors system CPU/memory and per-process metrics via sysmontap (tested via USB on iOS 15)
+  - All three payload formats supported: dict-based (Processes key), nested dict (System.processes/ProcessByPid), and array-packed
+  - Handles messages on both dedicated channel and global channel (-1)
+  - Auto-populates attributes with fallback to defaults
+- **DTX protocol core** - Handshake, message exchange, channel management, callbacks, global message routing all working
 - **USB connection** - Direct device connection via libimobiledevice
-- **Remote usbmux proxy** - Connection via sonic-gidevice shared port (tested with process listing and FPS monitoring)
+- **Remote usbmux proxy** - Connection via sonic-gidevice shared port (tested with process listing, FPS monitoring, and performance monitoring)
 
 ### 🔄 Implemented But Not Yet Tested
 - Process launch/kill operations
-- Performance monitoring via sysmontap (system + process metrics)
 - Port forwarding
 - iOS 17+ QUIC tunnel support (requires INSTRUMENTS_HAS_QUIC build flag)
 - XCTest service
@@ -452,12 +612,55 @@ This library was successfully implemented after fixing several critical protocol
 
 **Reference**: go-ios capability encoding, pymobiledevice3 message_aux_t_struct line 87 (Int64ul = unsigned).
 
+### Problem 7: Global Channel Message Routing (Feb 2026)
+**Symptom**: FPS and Performance services miss some messages, appear to work intermittently.
+
+**Root Cause**: Some iOS services (graphics.opengl, sysmontap) send messages on BOTH their dedicated channel AND the global/default channel (channel code -1 or 0xFFFFFFFF). Services only registered handlers on their dedicated channel.
+
+**Fix**: Implement `AddGlobalMessageHandler()` in DTXConnection to allow multiple handlers. Services now register parsers on both channels:
+```cpp
+m_channel->SetMessageHandler(parseMessage);
+m_dtxConnection->AddGlobalMessageHandler([parseMessage](auto msg) {
+    if (msg && static_cast<int32_t>(msg->ChannelCode()) == -1) {
+        parseMessage(msg);
+    }
+});
+```
+
+**Reference**: Tested on iOS 15, both FPS and Performance services require this pattern.
+
+### Problem 8: Early Message Arrival (Feb 2026)
+**Symptom**: Some performance data lost at service start, first few samples missing.
+
+**Root Cause**: sysmontap sends data immediately after receiving "start" command, before SendMessageSync() returns. If m_running flag and handlers aren't set up first, early messages are dropped.
+
+**Fix**: Set m_running=true and register handlers BEFORE sending start command:
+```cpp
+m_channel->SendMessageSync(setConfigMsg);  // 1. Config first
+m_running.store(true);                      // 2. Enable processing
+m_channel->SetMessageHandler(...);          // 3. Register handlers
+m_channel->SendMessageSync(startMsg);       // 4. Now start (messages arrive immediately)
+```
+
+### Problem 9: Multiple sysmontap Payload Formats (Feb 2026)
+**Symptom**: Process metrics work on some devices/sessions but not others, or return empty.
+
+**Root Cause**: iOS 15 sysmontap returns data in at least three different formats:
+1. Dict with top-level "Processes" key
+2. Dict with nested "System" dict containing "processes"/"ProcessByPid" keys (case variations)
+3. Array-packed format with "ProcessesAttributes" and flat "System" array
+
+**Fix**: Implement comprehensive parser in `ParseSysmontapMessage()` that tries all format variations with fallback logic. See performance_service.cpp lines 210-461 for full implementation.
+
 ### Key Takeaways
 1. **Always sync message identifiers** when device sends unsolicited messages
 2. **PrimitiveDictionary format is strict** - must include 0x0A marker before each entry
 3. **Handshake is bidirectional** - not request-response, so ExpectsReply=false
 4. **Payload messageType includes 0x1000 bit** when expecting replies
 5. **Capability values** - use NSObject(uint64_t) for capability values in handshake
+6. **Global message handler required** - services send on both dedicated channel and channel -1
+7. **Set handlers before start** - messages may arrive immediately, must be ready
+8. **Handle multiple payload formats** - iOS devices use different encoding schemes
 
 ## Things to Watch Out For
 
