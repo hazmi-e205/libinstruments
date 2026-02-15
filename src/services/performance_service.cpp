@@ -146,22 +146,36 @@ Error PerformanceService::Start(const PerfConfig& config,
         return Error::Timeout;
     }
 
-    // Set message handler for streaming data
-    m_channel->SetMessageHandler([this, systemCb, processCb, errorCb](
+    auto parseSysmonMessage = [this, systemCb, processCb, errorCb](
         std::shared_ptr<DTXMessage> msg) {
         if (!m_running.load()) return;
+        if (!msg) return;
 
         auto payload = msg->PayloadObject();
         if (payload) {
             ParseSysmontapMessage(*payload, systemCb, processCb);
         }
-    });
+    };
+
+    // Start receiving immediately; some devices stream before we get the start reply.
+    m_running.store(true);
+
+    // Set message handler for streaming data
+    m_channel->SetMessageHandler(parseSysmonMessage);
+
+    // Some sysmontap updates arrive on the default (-1 / 0xFFFFFFFF) channel.
+    if (m_dtxConnection) {
+        m_dtxConnection->AddGlobalMessageHandler([parseSysmonMessage](std::shared_ptr<DTXMessage> msg) {
+            if (!msg) return;
+            if (static_cast<int32_t>(msg->ChannelCode()) == -1) {
+                parseSysmonMessage(msg);
+            }
+        });
+    }
 
     // Send start
     auto startMsg = DTXMessage::CreateWithSelector("start");
     response = m_channel->SendMessageSync(startMsg);
-
-    m_running.store(true);
     INST_LOG_INFO(TAG, "Performance monitoring started (interval=%ums)",
                  actualConfig.sampleIntervalMs);
 
@@ -189,12 +203,64 @@ void PerformanceService::Stop() {
 void PerformanceService::ParseSysmontapMessage(const NSObject& data,
                                                  SystemPerfCallback systemCb,
                                                  ProcessPerfCallback processCb) {
-    if (!data.IsDict()) return;
+    const NSObject* dictPayload = nullptr;
+    if (data.IsDict()) {
+        dictPayload = &data;
+    } else if (data.IsArray() && !data.AsArray().empty()) {
+        const auto& arr = data.AsArray();
+        if (arr[0].IsDict()) {
+            dictPayload = &arr[0];
+        }
+    }
+    if (!dictPayload) {
+        INST_LOG_DEBUG(TAG, "Sysmontap payload not dict/array-dict (type=%d)",
+                       static_cast<int>(data.GetType()));
+        return;
+    }
+
+    static int s_logged = 0;
+    if (s_logged < 3) {
+        std::string keys;
+        for (const auto& [k, v] : dictPayload->AsDict()) {
+            if (!keys.empty()) keys.append(",");
+            keys.append(k);
+        }
+        bool hasProcs = dictPayload->HasKey("Processes");
+        bool hasProcsLower = dictPayload->HasKey("processes");
+        bool hasByPid = dictPayload->HasKey("ProcessByPid");
+        bool hasByPidLower = dictPayload->HasKey("processByPid");
+        int procsType = hasProcs ? static_cast<int>((*dictPayload)["Processes"].GetType()) : -1;
+        INST_LOG_INFO(TAG,
+                      "Sysmontap keys=[%s] size=%zu Processes=%d processes=%d ProcessByPid=%d processByPid=%d ProcessesType=%d",
+                      keys.c_str(), dictPayload->AsDict().size(),
+                      hasProcs ? 1 : 0, hasProcsLower ? 1 : 0,
+                      hasByPid ? 1 : 0, hasByPidLower ? 1 : 0, procsType);
+
+        if (dictPayload->HasKey("System")) {
+            const auto& sys = (*dictPayload)["System"];
+            INST_LOG_INFO(TAG, "Sysmontap System type=%d size=%zu",
+                          static_cast<int>(sys.GetType()), sys.Size());
+            if (sys.IsDict()) {
+                std::string skeys;
+                for (const auto& [k, v] : sys.AsDict()) {
+                    if (!skeys.empty()) skeys.append(",");
+                    skeys.append(k);
+                }
+                INST_LOG_INFO(TAG, "Sysmontap System keys=[%s]", skeys.c_str());
+            }
+        }
+
+        // One-time short JSON preview (first 512 chars) to locate process data.
+        std::string json = dictPayload->ToJson();
+        if (json.size() > 512) json = json.substr(0, 512) + "...";
+        INST_LOG_INFO(TAG, "Sysmontap JSON preview: %s", json.c_str());
+        s_logged++;
+    }
 
     // System metrics
-    if (systemCb && data.HasKey("SystemCPUUsage")) {
+    if (systemCb && dictPayload->HasKey("SystemCPUUsage")) {
         SystemMetrics metrics;
-        const auto& cpuUsage = data["SystemCPUUsage"];
+        const auto& cpuUsage = (*dictPayload)["SystemCPUUsage"];
         if (cpuUsage.IsDict()) {
             if (cpuUsage.HasKey("CPU_TotalLoad"))
                 metrics.cpuTotalLoad = cpuUsage["CPU_TotalLoad"].ToNumber();
@@ -203,18 +269,33 @@ void PerformanceService::ParseSysmontapMessage(const NSObject& data,
             if (cpuUsage.HasKey("CPU_SystemLoad"))
                 metrics.cpuSystemLoad = cpuUsage["CPU_SystemLoad"].ToNumber();
         }
-        if (data.HasKey("CPUCount"))
-            metrics.cpuCount = static_cast<uint64_t>(data["CPUCount"].ToNumber());
-        if (data.HasKey("EnabledCPUs"))
-            metrics.enabledCPUs = static_cast<uint64_t>(data["EnabledCPUs"].ToNumber());
+        if (dictPayload->HasKey("CPUCount"))
+            metrics.cpuCount = static_cast<uint64_t>((*dictPayload)["CPUCount"].ToNumber());
+        if (dictPayload->HasKey("EnabledCPUs"))
+            metrics.enabledCPUs = static_cast<uint64_t>((*dictPayload)["EnabledCPUs"].ToNumber());
 
         systemCb(metrics);
     }
 
     // Process metrics
-    if (processCb && data.HasKey("Processes")) {
-        const auto& procs = data["Processes"];
-        if (procs.IsDict()) {
+    if (processCb) {
+        const NSObject* procsPtr = nullptr;
+        if (dictPayload->HasKey("Processes") && (*dictPayload)["Processes"].IsDict()) {
+            procsPtr = &(*dictPayload)["Processes"];
+        } else if (dictPayload->HasKey("System") && (*dictPayload)["System"].IsDict()) {
+            const auto& sys = (*dictPayload)["System"];
+            if (sys.HasKey("Processes") && sys["Processes"].IsDict())
+                procsPtr = &sys["Processes"];
+            else if (sys.HasKey("processes") && sys["processes"].IsDict())
+                procsPtr = &sys["processes"];
+            else if (sys.HasKey("ProcessByPid") && sys["ProcessByPid"].IsDict())
+                procsPtr = &sys["ProcessByPid"];
+            else if (sys.HasKey("processByPid") && sys["processByPid"].IsDict())
+                procsPtr = &sys["processByPid"];
+        }
+
+        if (procsPtr && procsPtr->IsDict()) {
+            const auto& procs = *procsPtr;
             std::vector<ProcessMetrics> processMetrics;
             for (const auto& [pidStr, procData] : procs.AsDict()) {
                 ProcessMetrics pm;
@@ -274,6 +355,86 @@ void PerformanceService::ParseSysmontapMessage(const NSObject& data,
 
             if (!processMetrics.empty()) {
                 processCb(processMetrics);
+            }
+        }
+
+        // Array-packed format: System is array, with ProcessesAttributes describing layout.
+        if (!procsPtr && dictPayload->HasKey("System") && (*dictPayload)["System"].IsArray()
+            && dictPayload->HasKey("ProcessesAttributes") && (*dictPayload)["ProcessesAttributes"].IsArray()) {
+            const auto& systemArr = (*dictPayload)["System"].AsArray();
+            const auto& procAttrsArr = (*dictPayload)["ProcessesAttributes"].AsArray();
+
+            std::vector<std::string> procAttrs;
+            procAttrs.reserve(procAttrsArr.size());
+            for (const auto& item : procAttrsArr) {
+                if (item.IsString()) procAttrs.push_back(item.AsString());
+            }
+            if (procAttrs.empty()) {
+                procAttrs = m_processAttributes;
+            }
+
+            size_t sysAttrCount = 0;
+            if (dictPayload->HasKey("SystemAttributes") && (*dictPayload)["SystemAttributes"].IsArray()) {
+                sysAttrCount = (*dictPayload)["SystemAttributes"].AsArray().size();
+            }
+
+            if (!procAttrs.empty() && !systemArr.empty()) {
+                const size_t procAttrCount = procAttrs.size();
+                size_t sysCount = sysAttrCount;
+                size_t remain = (systemArr.size() > sysCount) ? (systemArr.size() - sysCount) : 0;
+
+                // If SystemAttributes count doesn't line up, try treating System as pure process rows.
+                if (procAttrCount > 0 && (remain == 0 || (remain % procAttrCount) != 0)) {
+                    sysCount = 0;
+                    remain = systemArr.size();
+                }
+
+                static int s_sysLayoutLogged = 0;
+                if (s_sysLayoutLogged < 3) {
+                    INST_LOG_INFO(TAG,
+                                  "Sysmontap layout: systemArr=%zu sysAttrs=%zu procAttrs=%zu sysCount=%zu remain=%zu remain%%proc=%zu",
+                                  systemArr.size(), sysAttrCount, procAttrCount, sysCount, remain,
+                                  (procAttrCount ? (remain % procAttrCount) : 0));
+                    s_sysLayoutLogged++;
+                }
+
+                if (procAttrCount > 0 && remain >= procAttrCount && (remain % procAttrCount) == 0) {
+                    std::vector<ProcessMetrics> processMetrics;
+                    processMetrics.reserve(remain / procAttrCount);
+
+                    for (size_t offset = sysCount; offset + procAttrCount <= systemArr.size(); offset += procAttrCount) {
+                        ProcessMetrics pm;
+                        for (size_t i = 0; i < procAttrCount; i++) {
+                            const auto& attr = procAttrs[i];
+                            const auto& val = systemArr[offset + i];
+                            if (attr == "pid")
+                                pm.pid = static_cast<int64_t>(val.ToNumber());
+                            else if (attr == "name" && val.IsString())
+                                pm.name = val.AsString();
+                            else if (attr == "cpuUsage")
+                                pm.cpuUsage = val.ToNumber();
+                            else if (attr == "physFootprint")
+                                pm.memResident = static_cast<uint64_t>(val.ToNumber());
+                            else if (attr == "memAnon")
+                                pm.memAnon = static_cast<uint64_t>(val.ToNumber());
+                            else if (attr == "memVirtualSize")
+                                pm.memVirtual = static_cast<uint64_t>(val.ToNumber());
+                            else if (attr == "diskBytesRead")
+                                pm.diskBytesRead = static_cast<uint64_t>(val.ToNumber());
+                            else if (attr == "diskBytesWritten")
+                                pm.diskBytesWritten = static_cast<uint64_t>(val.ToNumber());
+                            else if (attr == "threadCount")
+                                pm.threads = static_cast<uint64_t>(val.ToNumber());
+                        }
+                        if (pm.pid != 0) {
+                            processMetrics.push_back(std::move(pm));
+                        }
+                    }
+
+                    if (!processMetrics.empty()) {
+                        processCb(processMetrics);
+                    }
+                }
             }
         }
     }

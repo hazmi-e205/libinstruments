@@ -4,12 +4,184 @@
 #include "../nskeyedarchiver/nskeyedunarchiver.h"
 #include "../util/lz4.h"
 #include "../util/log.h"
+#include <atomic>
 #include <cstring>
+#include <fstream>
 #include <sstream>
 
 namespace instruments {
 
 static const char* TAG = "DTXMessage";
+static std::atomic<uint32_t> g_lz4DumpCounter{0};
+
+static uint32_t ReadLE32(const uint8_t* p);
+
+static void DumpLZ4Payload(const uint8_t* data, size_t len) {
+    const uint32_t id = ++g_lz4DumpCounter;
+    if (id > 3 || data == nullptr || len == 0) {
+        return;
+    }
+
+    char filename[64] = {0};
+    std::snprintf(filename, sizeof(filename), "sysmontap_raw_%04u.bin", id);
+    std::ofstream out(filename, std::ios::binary);
+    if (!out.is_open()) {
+        INST_LOG_WARN(TAG, "Failed to open dump file: %s", filename);
+        return;
+    }
+    out.write(reinterpret_cast<const char*>(data), static_cast<std::streamsize>(len));
+    out.close();
+    INST_LOG_INFO(TAG, "Wrote LZ4 raw payload dump: %s (%zu bytes)", filename, len);
+}
+
+static std::vector<uint8_t> TryDecodeBV4Container(const uint8_t* data, size_t len) {
+    std::vector<uint8_t> out;
+    if (data == nullptr || len < 8) {
+        return out;
+    }
+
+    auto readBE32Local = [](const uint8_t* p) -> uint32_t {
+        return (static_cast<uint32_t>(p[0]) << 24)
+             | (static_cast<uint32_t>(p[1]) << 16)
+             | (static_cast<uint32_t>(p[2]) << 8)
+             | static_cast<uint32_t>(p[3]);
+    };
+
+    struct ChunkRef {
+        bool compressed;
+        uint32_t u;
+        const uint8_t* data;
+        uint32_t c;
+    };
+
+    std::vector<ChunkRef> sequence;
+    std::vector<uint8_t> compressedAgg;
+    std::vector<uint32_t> compU;
+    size_t pos = 0;
+
+    // First chunk: [u32 uncompressed][u32 compressed][compressed bytes]
+    uint32_t u0 = ReadLE32(data + pos);
+    uint32_t c0 = ReadLE32(data + pos + 4);
+    pos += 8;
+    if (c0 == 0 || pos + c0 > len) {
+        return out;
+    }
+    sequence.push_back({true, u0, data + pos, c0});
+    compU.push_back(u0);
+    compressedAgg.insert(compressedAgg.end(), data + pos, data + pos + c0);
+    pos += c0;
+
+    while (pos + 4 <= len) {
+        uint32_t tag = readBE32Local(data + pos);
+        if (tag == 0x62763424) { // "bv4$"
+            break;
+        }
+        if (tag == 0x62763431) { // "bv41" compressed chunk
+            if (pos + 12 > len) {
+                return {};
+            }
+            uint32_t u = ReadLE32(data + pos + 4);
+            uint32_t c = ReadLE32(data + pos + 8);
+            pos += 12;
+            if (c == 0 || pos + c > len) {
+                return {};
+            }
+            sequence.push_back({true, u, data + pos, c});
+            compU.push_back(u);
+            compressedAgg.insert(compressedAgg.end(), data + pos, data + pos + c);
+            pos += c;
+            continue;
+        }
+        if (tag == 0x6276342D) { // "bv4-" uncompressed chunk
+            if (pos + 8 > len) {
+                return {};
+            }
+            uint32_t u = ReadLE32(data + pos + 4);
+            pos += 8;
+            if (u == 0 || pos + u > len) {
+                return {};
+            }
+            sequence.push_back({false, u, data + pos, u});
+            pos += u;
+            continue;
+        }
+        // Unknown tag
+        break;
+    }
+    if (sequence.empty()) {
+        return {};
+    }
+
+    // First try: decompress each chunk individually with a streaming dictionary.
+    size_t totalOut = 0;
+    for (const auto& ch : sequence) {
+        totalOut += ch.compressed ? ch.u : ch.c;
+    }
+    out.reserve(totalOut);
+
+    bool ok = true;
+    for (const auto& ch : sequence) {
+        if (ch.compressed) {
+            const uint8_t* dict = nullptr;
+            size_t dictSize = 0;
+            if (!out.empty()) {
+                dictSize = out.size() > 65536 ? 65536 : out.size();
+                dict = out.data() + (out.size() - dictSize);
+            }
+            auto dec = LZ4::DecompressWithDict(ch.data, ch.c, ch.u, dict, dictSize);
+            if (dec.empty()) {
+                dec = LZ4::DecompressFrame(ch.data, ch.c, ch.u);
+            }
+            if (dec.empty()) {
+                ok = false;
+                break;
+            }
+            out.insert(out.end(), dec.begin(), dec.end());
+        } else {
+            out.insert(out.end(), ch.data, ch.data + ch.c);
+        }
+    }
+    if (ok && !out.empty()) {
+        return out;
+    }
+
+    // Fallback: aggregate all compressed chunks into one stream and decompress once.
+    if (compressedAgg.empty()) {
+        return {};
+    }
+    uint64_t totalU64 = 0;
+    for (auto u : compU) totalU64 += u;
+    size_t totalU = static_cast<size_t>(totalU64);
+
+    auto decAll = LZ4::Decompress(compressedAgg.data(), compressedAgg.size(), totalU);
+    if (decAll.empty()) {
+        decAll = LZ4::DecompressFrame(compressedAgg.data(), compressedAgg.size(), totalU);
+    }
+    if (decAll.empty()) {
+        return {};
+    }
+
+    out.clear();
+    size_t decPos = 0;
+    for (const auto& ch : sequence) {
+        if (ch.compressed) {
+            size_t take = ch.u;
+            if (decPos + take > decAll.size()) {
+                take = decAll.size() > decPos ? (decAll.size() - decPos) : 0;
+            }
+            if (take == 0) break;
+            out.insert(out.end(), decAll.begin() + decPos, decAll.begin() + decPos + take);
+            decPos += take;
+        } else {
+            out.insert(out.end(), ch.data, ch.data + ch.c);
+        }
+    }
+
+    if (out.empty()) {
+        return {};
+    }
+    return out;
+}
 
 // Little-endian read/write helpers
 static void WriteLE16(uint8_t* p, uint16_t val) {
@@ -201,6 +373,146 @@ std::shared_ptr<DTXMessage> DTXMessage::Decode(const DTXMessageHeader& header,
         return msg;
     }
 
+    auto parsePayloadSection = [&](const uint8_t* buf, size_t len) -> bool {
+        if (len < DTXProtocol::PayloadHeaderLength) {
+            return false;
+        }
+
+        DTXPayloadHeader ph;
+        ph.messageType = ReadLE32(buf);
+        ph.auxiliaryLength = ReadLE32(buf + 4);
+        ph.totalPayloadLength = ReadLE32(buf + 8);
+        ph.flags = ReadLE32(buf + 12);
+
+        const size_t remaining = len - DTXProtocol::PayloadHeaderLength;
+        if (ph.totalPayloadLength > remaining) {
+            return false;
+        }
+        if (ph.auxiliaryLength > ph.totalPayloadLength) {
+            return false;
+        }
+        if (ph.messageType == 0 || ph.messageType == static_cast<uint32_t>(DTXMessageType::LZ4Compressed)) {
+            return false;
+        }
+
+        msg->m_payloadHeader = ph;
+
+        const uint8_t* payloadStart = buf + DTXProtocol::PayloadHeaderLength;
+        size_t auxLen = ph.auxiliaryLength;
+        if (auxLen > 0 && auxLen <= remaining) {
+            if (auxLen > DTXProtocol::PayloadHeaderLength) {
+                const uint8_t* auxStart = payloadStart + DTXProtocol::PayloadHeaderLength;
+                size_t auxDataLen = auxLen - DTXProtocol::PayloadHeaderLength;
+                msg->m_auxiliary.assign(auxStart, auxStart + auxDataLen);
+            }
+        }
+
+        size_t payloadDataOffset = auxLen;
+        size_t payloadDataLen = remaining > payloadDataOffset ? remaining - payloadDataOffset : 0;
+        if (payloadDataLen > 0) {
+            msg->m_payload.assign(payloadStart + payloadDataOffset,
+                                 payloadStart + payloadDataOffset + payloadDataLen);
+        }
+
+        return true;
+    };
+
+    auto tryBplistFallback = [&](const uint8_t* scan, size_t scanLen, uint32_t msgType,
+                                 const char* label) -> bool {
+        if (!scan || scanLen < 8) {
+            return false;
+        }
+
+        const uint8_t magic[] = { 'b','p','l','i','s','t' };
+        const uint8_t* found = nullptr;
+        for (size_t i = 0; i + sizeof(magic) <= scanLen; i++) {
+            if (std::memcmp(scan + i, magic, sizeof(magic)) == 0) {
+                found = scan + i;
+                break;
+            }
+        }
+        if (!found) {
+            return false;
+        }
+
+        auto readBE64 = [](const uint8_t* p) -> uint64_t {
+            uint64_t v = 0;
+            for (int i = 0; i < 8; i++) {
+                v = (v << 8) | static_cast<uint64_t>(p[i]);
+            }
+            return v;
+        };
+
+        auto findNextPlist = [&](const uint8_t* start, size_t maxLen) -> const uint8_t* {
+            const uint8_t magic2[] = { 'b','p','l','i','s','t' };
+            for (size_t i = sizeof(magic2); i + sizeof(magic2) <= maxLen; i++) {
+                if (std::memcmp(start + i, magic2, sizeof(magic2)) == 0) {
+                    return start + i;
+                }
+            }
+            return nullptr;
+        };
+
+        auto findPlistLength = [&](const uint8_t* start, size_t maxLen) -> size_t {
+            if (maxLen < 32) return 0;
+            for (size_t end = maxLen; end >= 32; end--) {
+                const uint8_t* trailer = start + end - 32;
+                uint8_t offsetIntSize = trailer[6];
+                uint8_t objectRefSize = trailer[7];
+                if (offsetIntSize == 0 || offsetIntSize > 8) continue;
+                if (objectRefSize == 0 || objectRefSize > 8) continue;
+
+                uint64_t numObjects = readBE64(trailer + 8);
+                uint64_t topObject = readBE64(trailer + 16);
+                uint64_t offsetTableOffset = readBE64(trailer + 24);
+
+                if (numObjects == 0 || numObjects > 0xFFFFFFFFULL) continue;
+                if (topObject >= numObjects) continue;
+                if (offsetTableOffset >= (end - 32)) continue;
+                if (offsetTableOffset + (numObjects * offsetIntSize) > (end - 32)) continue;
+
+                return end;
+            }
+            return 0;
+        };
+
+        const size_t maxLen = static_cast<size_t>((scan + scanLen) - found);
+        size_t plistLen = 0;
+        size_t nextOffset = 0;
+
+        // If multiple bplists are concatenated, end at the next magic.
+        if (const uint8_t* next = findNextPlist(found, maxLen)) {
+            nextOffset = static_cast<size_t>(next - found);
+            plistLen = nextOffset;
+        }
+        if (plistLen == 0) {
+            plistLen = findPlistLength(found, maxLen);
+        }
+        if (plistLen == 0) {
+            plistLen = maxLen;
+        }
+
+        INST_LOG_INFO(TAG, "Bplist fallback (%s): foundOffset=%zu nextOffset=%zu plistLen=%zu maxLen=%zu",
+                      label ? label : "unknown",
+                      static_cast<size_t>(found - scan),
+                      nextOffset, plistLen, maxLen);
+        if (plistLen >= 8) {
+            char head[3 * 9] = {0};
+            for (size_t i = 0; i < 8; i++) {
+                std::snprintf(head + i * 3, sizeof(head) - i * 3, "%02X ", found[i]);
+            }
+            INST_LOG_INFO(TAG, "Bplist header (%s): %s", label ? label : "unknown", head);
+        }
+
+        std::vector<uint8_t> raw(found, found + plistLen);
+        msg->m_payloadHeader.messageType = msgType;
+        msg->m_payloadHeader.auxiliaryLength = 0;
+        msg->m_payloadHeader.totalPayloadLength = static_cast<uint32_t>(raw.size());
+        msg->m_payloadHeader.flags = 0;
+        msg->m_payload = std::move(raw);
+        return true;
+    };
+
     // Parse payload header
     if (length < DTXProtocol::PayloadHeaderLength) {
         INST_LOG_WARN(TAG, "Payload too small: %zu bytes", length);
@@ -225,22 +537,77 @@ std::shared_ptr<DTXMessage> DTXMessage::Decode(const DTXMessageHeader& header,
         uint32_t origType = ReadLE32(payloadStart);
         // Next 4 bytes: decompressed size
         uint32_t decompSize = ReadLE32(payloadStart + 4);
+        if (decompSize == 0 || decompSize > (128u * 1024u * 1024u)) {
+            uint32_t beType = (static_cast<uint32_t>(payloadStart[0]) << 24)
+                            | (static_cast<uint32_t>(payloadStart[1]) << 16)
+                            | (static_cast<uint32_t>(payloadStart[2]) << 8)
+                            | static_cast<uint32_t>(payloadStart[3]);
+            uint32_t beSize = (static_cast<uint32_t>(payloadStart[4]) << 24)
+                            | (static_cast<uint32_t>(payloadStart[5]) << 16)
+                            | (static_cast<uint32_t>(payloadStart[6]) << 8)
+                            | static_cast<uint32_t>(payloadStart[7]);
+            origType = beType;
+            decompSize = beSize;
+        }
 
-        auto decompressed = LZ4::Decompress(payloadStart + 8, remaining - 8, decompSize);
+        size_t maxOut = decompSize;
+        if (maxOut == 0 || maxOut > (128u * 1024u * 1024u)) {
+            maxOut = 64u * 1024u * 1024u;
+        }
+
+        auto decompressed = LZ4::Decompress(payloadStart + 8, remaining - 8, maxOut);
         if (decompressed.empty()) {
-            INST_LOG_ERROR(TAG, "LZ4 decompression failed");
+            // Try LZ4 frame format
+            decompressed = LZ4::DecompressFrame(payloadStart + 8, remaining - 8, maxOut);
+        }
+        bool usedBv4 = false;
+        if (decompressed.empty()) {
+            // Try custom "bv4" container used by instruments sysmontap
+            decompressed = TryDecodeBV4Container(payloadStart + 8, remaining - 8);
+            if (!decompressed.empty()) {
+                usedBv4 = true;
+            }
+        }
+        if (decompressed.empty()) {
+            // Dump first bytes to identify frame/block format
+            char hex[3 * 17] = {0};
+            const size_t dumpLen = remaining - 8 < 16 ? (remaining - 8) : 16;
+            for (size_t i = 0; i < dumpLen; i++) {
+                std::snprintf(hex + i * 3, sizeof(hex) - i * 3, "%02X ", payloadStart[8 + i]);
+            }
+            INST_LOG_ERROR(TAG, "LZ4 decompression failed (origType=0x%08X, decompSize=%u, first=%s)",
+                          origType, decompSize, hex);
+
+            DumpLZ4Payload(payloadStart + 8, remaining - 8);
+
+            if (tryBplistFallback(payloadStart + 8, remaining - 8, origType, "lz4-raw")) {
+                return msg;
+            }
+
             return msg;
         }
 
         msg->m_payloadHeader.messageType = origType;
+        if (usedBv4) {
+            INST_LOG_INFO(TAG, "Decoded bv4 container: %zu bytes", decompressed.size());
+        }
 
-        // Re-parse the decompressed data
+        // If decompressed data includes a payload header, parse it.
+        if (parsePayloadSection(decompressed.data(), decompressed.size())) {
+            return msg;
+        }
+
+        if (tryBplistFallback(decompressed.data(), decompressed.size(), origType,
+                              usedBv4 ? "bv4" : "lz4-decompressed")) {
+            return msg;
+        }
+
+        // Fallback: treat decompressed data as aux+payload (no payload header)
         size_t auxLen = msg->m_payloadHeader.auxiliaryLength;
         if (auxLen > 0 && auxLen <= decompressed.size()) {
             msg->m_auxiliary.assign(decompressed.begin(), decompressed.begin() + auxLen);
         }
-
-        size_t payloadDataLen = decompressed.size() - auxLen;
+        size_t payloadDataLen = decompressed.size() > auxLen ? decompressed.size() - auxLen : 0;
         if (payloadDataLen > 0) {
             msg->m_payload.assign(decompressed.begin() + auxLen, decompressed.end());
         }
@@ -249,23 +616,7 @@ std::shared_ptr<DTXMessage> DTXMessage::Decode(const DTXMessageHeader& header,
     }
 
     // Non-compressed: extract auxiliary and payload
-    size_t auxLen = msg->m_payloadHeader.auxiliaryLength;
-    if (auxLen > 0 && auxLen <= remaining) {
-        if (auxLen <= DTXProtocol::PayloadHeaderLength) {
-            INST_LOG_WARN(TAG, "Auxiliary length too small: %zu bytes", auxLen);
-        } else {
-            const uint8_t* auxStart = payloadStart + DTXProtocol::PayloadHeaderLength;
-            size_t auxDataLen = auxLen - DTXProtocol::PayloadHeaderLength;
-            msg->m_auxiliary.assign(auxStart, auxStart + auxDataLen);
-        }
-    }
-
-    size_t payloadDataOffset = auxLen;
-    size_t payloadDataLen = remaining > payloadDataOffset ? remaining - payloadDataOffset : 0;
-    if (payloadDataLen > 0) {
-        msg->m_payload.assign(payloadStart + payloadDataOffset,
-                             payloadStart + payloadDataOffset + payloadDataLen);
-    }
+    parsePayloadSection(data, length);
 
     return msg;
 }
