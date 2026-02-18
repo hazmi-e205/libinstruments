@@ -2,17 +2,19 @@
 
 A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB/network, iOS 17+ via QUIC tunnel (picoquic + picotls + lwIP), and remote usbmux proxy connections (sonic-gidevice / go-ios).
 
-**Status**: ✅ DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on iOS 15 via USB. Designed for iOS 14-17+.
+**Status**: ✅ DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on **iOS 12 and iOS 15** via USB. Supports iOS 12-17+.
 
 ## Features
 
-### ✅ Tested and Working (iOS 15)
-- **Process Listing** - Get running processes (tested via USB and remote usbmux)
-- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl` (tested via USB and remote usbmux)
-- **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap` (tested via USB on iOS 15)
+### ✅ Tested and Working (iOS 12 & iOS 15)
+- **Process Listing** - Get running processes (tested on iOS 12 & iOS 15 via USB and remote usbmux)
+- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl` (tested on iOS 12 & iOS 15 via USB and remote usbmux)
+- **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap` (tested on iOS 12 & iOS 15 via USB)
   - Supports multiple iOS data formats: dict-based (Processes key), nested dict (System.processes/ProcessByPid), and array-packed layouts
   - Handles messages on both dedicated channel and global channel (-1)
 - **DTX Protocol** - Handshake, message exchange, channel management, global message routing
+- **iOS Version Detection** - Automatic protocol selection based on iOS version (12-13: Legacy, 14-16: Modern, 17+: RSD)
+- **SSL Mode Handling** - Version-specific SSL behavior (pre-14: handshake-only, 14-16: full SSL, 17+: no SSL)
 - **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port (tested on iOS 15)
 - **Cross-Platform** - Windows, Linux, macOS
 
@@ -451,11 +453,17 @@ Payload: NSKeyedArchiver-encoded selector or return value
 
 ### Service Names
 
-| iOS Version | Service Identifier | SSL Mode |
-|---|---|---|
-| < 14 | `com.apple.instruments.remoteserver` | Handshake-only (plaintext DTX) |
-| 14-16 | `com.apple.instruments.remoteserver.DVTSecureSocketProxy` | Full SSL |
-| 17+ | `com.apple.instruments.dtservicehub` | No service SSL (tunnel encrypts) |
+| iOS Version | Protocol | Service Identifier | SSL Mode |
+|---|---|---|---|
+| 12-13 | Legacy | `com.apple.instruments.remoteserver` | Handshake-only (auth then plaintext DTX) |
+| 14-16 | Modern | `com.apple.instruments.remoteserver.DVTSecureSocketProxy` | Full SSL encryption |
+| 17+ | RSD | `com.apple.instruments.dtservicehub` | No SSL (QUIC tunnel encrypts) |
+
+**How it works:**
+1. Library detects iOS version via lockdown (`ProductVersion` key)
+2. Selects appropriate protocol: `IOSProtocol::Legacy` (iOS <14), `Modern` (14-16), or `RSD` (17+)
+3. Chooses matching service name and SSL behavior
+4. Creates DTX connection with correct SSL mode (handshake-only for Legacy, full for Modern, none for RSD)
 
 ## API Reference
 

@@ -146,7 +146,7 @@ std::unique_ptr<DTXConnection> DeviceConnection::CreateInstrumentConnection() {
     }
 
     std::string serviceName = ServiceConnector::GetInstrumentServiceName(protocol);
-    bool sslHandshakeOnly = ServiceConnector::NeedsSSLHandshakeOnly(serviceName);
+    bool sslHandshakeOnly = ServiceConnector::NeedsSSLHandshakeOnly(serviceName) && service->ssl_enabled;
 
     INST_LOG_DEBUG(TAG, "Creating DTX connection: service=%s, sslHandshakeOnly=%d, ssl_enabled=%d",
                   serviceName.c_str(), sslHandshakeOnly ? 1 : 0, service->ssl_enabled ? 1 : 0);
@@ -175,7 +175,7 @@ std::unique_ptr<DTXConnection> DeviceConnection::CreateServiceConnection(const s
         return nullptr;
     }
 
-    bool sslHandshakeOnly = ServiceConnector::NeedsSSLHandshakeOnly(serviceName);
+    bool sslHandshakeOnly = ServiceConnector::NeedsSSLHandshakeOnly(serviceName) && service->ssl_enabled;
     auto conn = DTXConnection::Create(m_device, service, sslHandshakeOnly);
     lockdownd_service_descriptor_free(service);
 

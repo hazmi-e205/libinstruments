@@ -4,7 +4,7 @@
 
 `libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
 
-**Status**: ✅ DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on iOS 15 via USB (as of Feb 2026). Designed to support iOS 14-17+.
+**Status**: ✅ DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on **iOS 12 and iOS 15** via USB (as of Feb 2026). Supports iOS 12-17+.
 
 ## Code Style
 
@@ -99,9 +99,17 @@ ONLY send ACK if message.ExpectsReply==true (NO special case for handshake)
 
 ### SSL Behavior (Version-Dependent)
 
-- **Pre-iOS 14**: `com.apple.instruments.remoteserver` uses **handshake-only SSL** (SSL handshake for auth, then plaintext DTX)
-- **iOS 14-16**: `com.apple.instruments.remoteserver.DVTSecureSocketProxy` uses **full SSL** (all DTX traffic encrypted)
-- **iOS 17+**: `com.apple.instruments.dtservicehub` via RSD tunnel uses **no service-level SSL** (tunnel handles encryption)
+- **iOS 12-13 (Legacy)**: `com.apple.instruments.remoteserver` uses **handshake-only SSL**
+  - SSL handshake performed for authentication (`idevice_connection_enable_ssl()`)
+  - SSL immediately disabled (`idevice_connection_disable_ssl()`)
+  - All DTX protocol communication happens in **plaintext** after handshake
+  - Implemented in `DTXTransport` constructor with `sslHandshakeOnly=true`
+- **iOS 14-16 (Modern)**: `com.apple.instruments.remoteserver.DVTSecureSocketProxy` uses **full SSL**
+  - SSL enabled and remains active for entire session
+  - All DTX messages encrypted end-to-end
+- **iOS 17+ (RSD)**: `com.apple.instruments.dtservicehub` via RSD tunnel uses **no service-level SSL**
+  - QUIC tunnel provides transport-level encryption
+  - Service connection is plaintext (secured by tunnel layer)
 
 ### Fragments
 
@@ -109,11 +117,20 @@ ONLY send ACK if message.ExpectsReply==true (NO special case for handshake)
 
 ## Service Name Selection
 
+The library automatically selects the correct service and SSL mode based on iOS version:
+
 ```
-iOS < 14:  com.apple.instruments.remoteserver                      (handshake-only SSL)
-iOS 14-16: com.apple.instruments.remoteserver.DVTSecureSocketProxy (full SSL)
-iOS 17+:   com.apple.instruments.dtservicehub                      (RSD tunnel, no service SSL)
+iOS 12-13 (Legacy):  com.apple.instruments.remoteserver                      (handshake-only SSL)
+iOS 14-16 (Modern):  com.apple.instruments.remoteserver.DVTSecureSocketProxy (full SSL)
+iOS 17+   (RSD):    com.apple.instruments.dtservicehub                      (RSD tunnel, no service SSL)
 ```
+
+**Detection flow:**
+1. `ServiceConnector::DetectProtocol()` queries device iOS version via lockdown
+2. Returns `IOSProtocol::Legacy` (major < 14), `Modern` (14-16), or `RSD` (17+)
+3. `GetInstrumentServiceName()` maps protocol to service name
+4. `NeedsSSLHandshakeOnly()` determines SSL mode based on service name
+5. `DTXTransport` applies SSL settings during connection
 
 TestManagerD follows the same pattern:
 ```
@@ -540,13 +557,23 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 
 ## Testing Status
 
-### ✅ Verified Working on iOS 15
+### ✅ Verified Working on iOS 12 & iOS 15
+
+**iOS 12.x (Legacy Protocol - Feb 2026)**
+- **Process listing** - GetProcessList() successfully retrieves running processes with PID, name, bundle ID via USB
+- **FPS monitoring** - FPSService successfully monitors real-time FPS and GPU utilization via graphics.opengl channel via USB
+- **Performance monitoring** - PerformanceService successfully monitors system CPU/memory and per-process metrics via sysmontap via USB
+- **SSL handshake-only mode** - Verified that `com.apple.instruments.remoteserver` works with SSL handshake followed by plaintext DTX
+- **Protocol detection** - Automatic detection of iOS version and Legacy protocol selection confirmed working
+
+**iOS 15.x (Modern Protocol - Feb 2026)**
 - **Process listing** - GetProcessList() successfully retrieves running processes with PID, name, bundle ID (tested via USB and remote proxy)
 - **FPS monitoring** - FPSService successfully monitors real-time FPS and GPU utilization via graphics.opengl channel with rate limiting (tested via USB and remote proxy)
-- **Performance monitoring** - PerformanceService successfully monitors system CPU/memory and per-process metrics via sysmontap (tested via USB on iOS 15)
+- **Performance monitoring** - PerformanceService successfully monitors system CPU/memory and per-process metrics via sysmontap (tested via USB)
   - All three payload formats supported: dict-based (Processes key), nested dict (System.processes/ProcessByPid), and array-packed
   - Handles messages on both dedicated channel and global channel (-1)
   - Auto-populates attributes with fallback to defaults
+- **Full SSL encryption** - Verified that `DVTSecureSocketProxy` works with full SSL encryption for all DTX traffic
 - **DTX protocol core** - Handshake, message exchange, channel management, callbacks, global message routing all working
 - **USB connection** - Direct device connection via libimobiledevice
 - **Remote usbmux proxy** - Connection via sonic-gidevice shared port (tested with process listing, FPS monitoring, and performance monitoring)
@@ -557,7 +584,7 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 - iOS 17+ QUIC tunnel support (requires INSTRUMENTS_HAS_QUIC build flag)
 - XCTest service
 - WDA service
-- iOS < 14 and iOS 16+ versions (protocol design supports them)
+- iOS 13, 14, 16 versions (protocol design supports them, but not explicitly tested)
 
 ## Debugging Journey & Lessons Learned (Feb 2026)
 
@@ -667,11 +694,90 @@ m_channel->SendMessageSync(startMsg);       // 4. Now start (messages arrive imm
 7. **Set handlers before start** - messages may arrive immediately, must be ready
 8. **Handle multiple payload formats** - iOS devices use different encoding schemes
 
+## Architecture: iOS Version Detection & Service Selection
+
+### How iOS 12 Support Was Implemented (Feb 2026)
+
+The library now automatically detects iOS version and selects the appropriate DTX protocol variant. This enables support for iOS 12-17+ with a single unified API.
+
+**Key Components:**
+
+1. **ServiceConnector::DetectProtocol()** (`src/connection/service_connector.cpp:134`)
+   - Queries device's `ProductVersion` from lockdown
+   - Parses major version number
+   - Returns `IOSProtocol::Legacy` (iOS <14), `Modern` (14-16), or `RSD` (17+)
+
+2. **ServiceConnector::GetInstrumentServiceName()** (`service_connector.cpp:23`)
+   - Maps protocol enum to service name string:
+     - `Legacy` → `"com.apple.instruments.remoteserver"`
+     - `Modern` → `"com.apple.instruments.remoteserver.DVTSecureSocketProxy"`
+     - `RSD` → `"com.apple.instruments.dtservicehub"`
+
+3. **ServiceConnector::NeedsSSLHandshakeOnly()** (`service_connector.cpp:203`)
+   - Checks if service name requires handshake-only SSL mode
+   - Returns `true` for `"com.apple.instruments.remoteserver"` (iOS 12-13)
+   - Returns `false` for other services
+
+4. **DTXTransport constructor** (`src/dtx/dtx_transport.cpp:22`)
+   - Accepts `sslHandshakeOnly` parameter
+   - If true: calls `idevice_connection_enable_ssl()` then immediately `idevice_connection_disable_ssl()`
+   - If false: keeps SSL enabled for full encryption (iOS 14-16) or no SSL (iOS 17+)
+
+5. **DeviceConnection::CreateDTXConnection()** (`src/connection/device_connection.cpp:141`)
+   - Orchestrates the entire flow:
+     1. Detects protocol via `DetectProtocol()`
+     2. Gets service name via `GetInstrumentServiceName()`
+     3. Starts lockdown service
+     4. Determines SSL mode via `NeedsSSLHandshakeOnly()`
+     5. Creates `DTXConnection` with appropriate SSL settings
+
+**Integration with Qt Application:**
+
+The iDebugTool Qt app (`Src/devicebridge_instrument.cpp`) was migrated from manual DTX protocol handling to the high-level `Instruments` facade:
+
+```cpp
+// Old approach (manual DTX)
+m_clients[op]->transport = new DTXTransport(m_clients[op]->device, false);
+m_clients[op]->connection = new DTXConnection(m_clients[op]->transport);
+m_clients[op]->channel = m_clients[op]->connection->MakeChannelWithIdentifier(...);
+// Manual message construction and parsing
+
+// New approach (automatic protocol selection)
+m_clients[op]->instrument = Instruments::Create(m_clients[op]->device, m_clients[op]->client);
+m_clients[op]->instrument->Process().GetProcessList(procs);
+m_clients[op]->instrument->FPS().Start(interval_ms, callback);
+m_clients[op]->instrument->Performance().Start(config, sysCallback, procCallback);
+```
+
+**Benefits:**
+- Single API works across iOS 12-17+ without application code changes
+- Automatic version detection and protocol selection
+- Correct SSL mode handling per iOS version
+- High-level service APIs hide protocol complexity
+- Type-safe callbacks and error handling
+
+### Service Fallback Mechanism
+
+When starting a service, the library tries service names in order with fallback:
+
+```cpp
+// For iOS 14+ device, tries in order:
+1. com.apple.instruments.remoteserver.DVTSecureSocketProxy (Modern)
+2. com.apple.instruments.remoteserver (Legacy fallback)
+
+// For iOS 12-13 device, tries only:
+1. com.apple.instruments.remoteserver (Legacy)
+```
+
+This ensures compatibility even if version detection is imprecise or the device has unexpected service availability.
+
 ## Things to Watch Out For
 
 - **DTX handshake is mandatory and complex**: See "Handshake Protocol" section above for all critical requirements
 - **Message identifier synchronization**: MUST sync counter when device sends messages (most common failure mode)
 - **PrimitiveDictionary format**: MUST include 0x0A marker before each entry
+- **iOS version detection**: Must query `ProductVersion` from lockdown to determine protocol
+- **SSL mode must match iOS version**: Handshake-only for iOS <14, full for 14-16, none for 17+
 - DTX message identifiers must be unique per connection (monotonic counter)
 - Channel code 0 is the global channel (auto-created, never explicitly requested)
 - Fragment reassembly is keyed by message identifier
