@@ -1,7 +1,6 @@
 #include "../../include/instruments/fps_service.h"
 #include "../nskeyedarchiver/nsobject.h"
 #include "../util/log.h"
-#include <chrono>
 
 namespace instruments {
 
@@ -22,8 +21,6 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
     if (m_running.load()) {
         Stop();
     }
-    m_sampleIntervalMs.store(sampleIntervalMs);
-    m_lastCallbackMs.store(0);
 
     // Create persistent DTX connection
     m_dtxConnection = m_connection->CreateInstrumentConnection();
@@ -48,7 +45,7 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
     m_channel->SendMessageSync(driversMsg);
 
     // Set sampling rate
-    float rate = static_cast<float>(sampleIntervalMs) / 1000.0f;
+    float rate = static_cast<float>(sampleIntervalMs) / 100.0f;
     auto rateMsg = DTXMessage::CreateWithSelector("setSamplingRate:");
     rateMsg->AppendAuxiliary(NSObject(rate));
     m_channel->SendMessageSync(rateMsg);
@@ -83,20 +80,7 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
             fpsData.fps = payload->ToNumber();
         }
 
-        if (callback) {
-            const uint32_t intervalMs = m_sampleIntervalMs.load();
-            if (intervalMs > 0) {
-                const auto now = std::chrono::steady_clock::now();
-                const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now.time_since_epoch()).count();
-                const auto lastMs = m_lastCallbackMs.load();
-                if (lastMs != 0 && (nowMs - lastMs) < static_cast<int64_t>(intervalMs)) {
-                    return;
-                }
-                m_lastCallbackMs.store(nowMs);
-            }
-            callback(fpsData);
-        }
+        if (callback) callback(fpsData);
     };
 
     // Set message handler for streaming FPS data (channel messages)
@@ -128,7 +112,6 @@ void FPSService::Stop() {
     if (!m_running.exchange(false)) return;
 
     INST_LOG_INFO(TAG, "Stopping FPS monitoring");
-    m_lastCallbackMs.store(0);
 
     if (m_channel) {
         auto stopMsg = DTXMessage::CreateWithSelector("stopSampling");
