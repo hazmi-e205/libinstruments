@@ -107,8 +107,9 @@ Error PerformanceService::Start(const PerfConfig& config,
     configDict["bm"] = NSObject(static_cast<int32_t>(actualConfig.bm));
     configDict["cpuUsage"] = NSObject(true);
     configDict["physFootprint"] = NSObject(true);
+    // sysmontap expects sampleInterval in nanoseconds on modern iOS.
     configDict["sampleInterval"] = NSObject(static_cast<int64_t>(
-        actualConfig.sampleIntervalMs * 1000000LL));
+        static_cast<uint64_t>(actualConfig.sampleIntervalMs) * 1000000ULL));
 
     // Process attributes as NSSet
     NSObject::ArrayType procAttrs;
