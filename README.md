@@ -1,21 +1,20 @@
 # libinstruments
 
-A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB/network, iOS 17+ via QUIC tunnel (picoquic + picotls + lwIP), and remote usbmux proxy connections (sonic-gidevice / go-ios).
+A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB, iOS 17+ via QUIC tunnel (picoquic + picotls + lwIP).
 
 **Status**: ✅ DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on **iOS 12 and iOS 15** via USB. Supports iOS 12-17+.
 
 ## Features
 
 ### ✅ Tested and Working (iOS 12 & iOS 15)
-- **Process Listing** - Get running processes (tested on iOS 12 & iOS 15 via USB and remote usbmux)
-- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl` (tested on iOS 12 & iOS 15 via USB and remote usbmux)
+- **Process Listing** - Get running processes (tested on iOS 12 & iOS 15 via USB)
+- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl` (tested on iOS 12 & iOS 15 via USB)
 - **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap` (tested on iOS 12 & iOS 15 via USB)
   - Supports multiple iOS data formats: dict-based (Processes key), nested dict (System.processes/ProcessByPid), and array-packed layouts
   - Handles messages on both dedicated channel and global channel (-1)
 - **DTX Protocol** - Handshake, message exchange, channel management, global message routing
 - **iOS Version Detection** - Automatic protocol selection based on iOS version (12-13: Legacy, 14-16: Modern, 17+: RSD)
 - **SSL Mode Handling** - Version-specific SSL behavior (pre-14: handshake-only, 14-16: full SSL, 17+: no SSL)
-- **Remote Usbmux Proxy** - Connect via sonic-gidevice / go-ios shared port (tested on iOS 15)
 - **Cross-Platform** - Windows, Linux, macOS
 
 ### 🔄 Implemented But Not Yet Tested
@@ -231,94 +230,6 @@ if (err != Error::Success) {
 }
 ```
 
-### Remote Usbmux Proxy (✅ Tested on iOS 15)
-
-Connect to iOS devices over the network via remote usbmux proxy servers like [sonic-gidevice](https://github.com/SonicCloudOrg/sonic-gidevice) or [go-ios](https://github.com/danielpaulus/go-ios).
-
-**⚠️ Important**: This feature requires **patched libimobiledevice functions** that are NOT in the official repo:
-
-```c
-// Connect to remote usbmux proxy (e.g., sonic-gidevice at 192.168.1.100:5555)
-idevice_error_t idevice_new_remote(idevice_t *device, const char *ip_address, uint16_t port);
-
-// Perform lockdown handshake via the remote connection
-lockdownd_error_t lockdownd_client_new_with_handshake_remote(idevice_t device,
-                                                               lockdownd_client_t *client,
-                                                               const char *label);
-```
-
-**In iDebugTool**: These functions are patched by the build script automatically during the build process. The patches are located at `Externals/_Patches/libimobiledevice.patch` and applied to the libimobiledevice source.
-
-#### Example: Connect via sonic-gidevice
-
-```cpp
-// 1. Start sonic-gidevice on the iOS device host (e.g., macOS machine with USB-connected iPhone)
-//    $ gidevice share --port 5555
-
-// 2. Connect to remote usbmux proxy using patched libimobiledevice functions
-idevice_t device = nullptr;
-idevice_error_t err = idevice_new_remote(&device, "192.168.1.100", 5555);
-if (err != IDEVICE_E_SUCCESS || !device) {
-    fprintf(stderr, "Failed to connect to remote usbmux at 192.168.1.100:5555\n");
-    return 1;
-}
-
-// 3. Create lockdown client with remote handshake
-lockdownd_client_t lockdown = nullptr;
-lockdownd_error_t lerr = lockdownd_client_new_with_handshake_remote(device, &lockdown, "my-app");
-if (lerr != LOCKDOWN_E_SUCCESS || !lockdown) {
-    fprintf(stderr, "Failed to create lockdown client\n");
-    idevice_free(device);
-    return 1;
-}
-
-// 4. Create Instruments instance (library does NOT take ownership)
-auto inst = Instruments::Create(device, lockdown);
-if (!inst) {
-    fprintf(stderr, "Failed to create Instruments connection\n");
-    lockdownd_client_free(lockdown);
-    idevice_free(device);
-    return 1;
-}
-
-// 5. Use normally - all features work transparently
-std::vector<ProcessInfo> procs;
-Error err2 = inst->Process().GetProcessList(procs);
-if (err2 == Error::Success) {
-    printf("Connected to remote device via %s\n", inst->GetDeviceInfo().name.c_str());
-    for (const auto& p : procs) {
-        printf("  PID: %lld  %s\n", (long long)p.pid, p.name.c_str());
-    }
-}
-
-// FPS monitoring also works via remote proxy
-inst->FPS().Start(1000, [](const FPSData& data) {
-    printf("FPS: %.1f  GPU: %.1f%%\n", data.fps, data.gpuUtilization);
-}, nullptr);
-
-// 6. Cleanup (when done with Instruments instance)
-lockdownd_client_free(lockdown);
-idevice_free(device);
-```
-
-#### How It Works
-
-1. **sonic-gidevice** runs on the machine with USB-connected iOS device
-2. It exposes a TCP port (e.g., 5555) that speaks the usbmux protocol
-3. `idevice_new_remote()` connects to this remote port instead of local usbmuxd socket
-4. `lockdownd_client_new_with_handshake_remote()` performs lockdown handshake over the remote connection
-5. Pass the device and lockdown handles to `Instruments::Create(device, lockdown)`
-6. All DTX protocol communication happens transparently over the network
-7. **This is NOT an RSD tunnel** - it's a remote usbmux proxy (works on iOS 14-16, possibly iOS 17+ too)
-
-#### Notes
-
-- Tested successfully on **iOS 15** with process listing and FPS monitoring
-- Works with both **sonic-gidevice** (Go) and **go-ios** (Go) proxy servers
-- Network latency may affect real-time monitoring performance
-- Requires the patched libimobiledevice functions (automatically applied in iDebugTool builds)
-- Can be used alongside local USB connections (library auto-detects connection type)
-
 ### iOS 17+ QUIC Tunnel (🔄 Not Yet Tested)
 
 iOS 17+ requires a QUIC tunnel for instruments communication. Enable with `INSTRUMENTS_HAS_QUIC` build flag.
@@ -345,8 +256,6 @@ for (const auto& t : tunnels) {
     printf("%s -> %s:%u\n", t.udid.c_str(), t.address.c_str(), t.rsdPort);
 }
 ```
-
-**Alternative**: Remote usbmux proxy tools (sonic-gidevice, go-ios) work for iOS 17+ devices by using `idevice_new_remote()` + `lockdownd_client_new_with_handshake_remote()` + `Instruments::Create(device, lockdown)`.
 
 ### CLI Tool
 
@@ -378,9 +287,6 @@ instruments-cli forward --udid <UDID> --host-port 8080 --device-port 80
 # Tunnel management (iOS 17+)
 instruments-cli tunnel list
 instruments-cli tunnel start --udid <UDID>
-
-# Using with external tunnel
-instruments-cli process list --tunnel [fd75:a1b2::1]:60789
 
 # Debug logging
 instruments-cli process list --udid <UDID> --verbose

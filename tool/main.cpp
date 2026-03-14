@@ -32,7 +32,6 @@ static void PrintUsage(const char* prog) {
         "\n"
         "Global options:\n"
         "  --udid <UDID>      Target device UDID\n"
-        "  --tunnel <addr:port>  Use tunnel address (iOS 17+)\n"
         "  --verbose          Enable debug logging\n"
         "  --quiet            Suppress info logging\n"
         "\n", prog);
@@ -43,8 +42,6 @@ struct CLIArgs {
     std::string command;
     std::string subcommand;
     std::string udid;
-    std::string tunnelAddr;
-    uint16_t tunnelPort = 0;
     std::string bundleId;
     std::string testRunnerBundleId;
     std::string xctestConfig;
@@ -76,13 +73,6 @@ static CLIArgs ParseArgs(int argc, char* argv[]) {
         std::string opt = argv[i];
         if (opt == "--udid" && i + 1 < argc) {
             args.udid = argv[++i];
-        } else if (opt == "--tunnel" && i + 1 < argc) {
-            std::string val = argv[++i];
-            auto colon = val.rfind(':');
-            if (colon != std::string::npos) {
-                args.tunnelAddr = val.substr(0, colon);
-                args.tunnelPort = static_cast<uint16_t>(std::atoi(val.substr(colon + 1).c_str()));
-            }
         } else if (opt == "--bundle" && i + 1 < argc) {
             args.bundleId = argv[++i];
         } else if (opt == "--runner" && i + 1 < argc) {
@@ -112,34 +102,10 @@ static CLIArgs ParseArgs(int argc, char* argv[]) {
 }
 
 static std::shared_ptr<Instruments> ConnectDevice(const CLIArgs& args) {
-    if (!args.tunnelAddr.empty()) {
-        // For remote usbmux: create device with idevice_new_remote, then pass to Instruments
-        idevice_t device = nullptr;
-        idevice_error_t err = idevice_new_remote(&device, args.tunnelAddr.c_str(), args.tunnelPort);
-        if (err != IDEVICE_E_SUCCESS || !device) {
-            fprintf(stderr, "Error: Failed to connect to remote usbmux at %s:%u\n",
-                    args.tunnelAddr.c_str(), args.tunnelPort);
-            return nullptr;
-        }
-
-        // Create lockdown with remote handshake
-        lockdownd_client_t lockdown = nullptr;
-        lockdownd_error_t lerr = lockdownd_client_new_with_handshake_remote(device, &lockdown, "instruments-cli");
-        if (lerr != LOCKDOWN_E_SUCCESS || !lockdown) {
-            fprintf(stderr, "Error: Failed to create lockdown client (error %d)\n", lerr);
-            idevice_free(device);
-            return nullptr;
-        }
-
-        auto inst = Instruments::Create(device, lockdown);
-        // Note: Instruments does NOT take ownership of device/lockdown
-        // They will be freed when the DeviceConnection is destroyed
-        return inst;
-    }
     if (!args.udid.empty()) {
         return Instruments::Create(args.udid);
     }
-    fprintf(stderr, "Error: --udid or --tunnel required\n");
+    fprintf(stderr, "Error: --udid required\n");
     return nullptr;
 }
 
