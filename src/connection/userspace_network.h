@@ -32,6 +32,10 @@ public:
     using RecvCallback = std::function<void(const uint8_t* data, size_t length)>;
     void SetRecvCallback(RecvCallback cb) { m_recvCb = std::move(cb); }
 
+    // Set callback when connection is established (success=true) or failed (false)
+    using ConnectedCallback = std::function<void(bool success)>;
+    void SetConnectedCallback(ConnectedCallback cb) { m_connectedCb = std::move(cb); }
+
     // Set callback for connection errors
     using ErrorCallback = std::function<void(Error err)>;
     void SetErrorCallback(ErrorCallback cb) { m_errorCb = std::move(cb); }
@@ -48,6 +52,7 @@ private:
     tcp_pcb* m_pcb = nullptr;
     std::atomic<bool> m_connected{false};
     RecvCallback m_recvCb;
+    ConnectedCallback m_connectedCb;
     ErrorCallback m_errorCb;
 
     // lwIP callbacks (static, casted through arg pointer)

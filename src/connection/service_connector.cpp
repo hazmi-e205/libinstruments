@@ -3,6 +3,12 @@
 #include <cstring>
 #include <cstdlib>
 
+// Undefine Windows API macro that collides with StartService method name
+// <winsvc.h> (via <windows.h>) defines StartService as StartServiceW
+#ifdef StartService
+#undef StartService
+#endif
+
 namespace instruments {
 
 static const char* TAG = "ServiceConnector";

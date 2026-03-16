@@ -9,17 +9,24 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
+
+// Undefine Windows API macros that collide with method names
+#ifdef SendMessage
+#undef SendMessage
+#endif
 
 namespace instruments {
 
 // DTXTransport - low-level transport for sending and receiving raw DTX
-// message frames over an idevice_connection_t.
+// message frames over an idevice_connection_t or a raw TCP socket.
 //
 // Handles:
 // - Reading complete DTX messages (header + payload)
 // - Writing DTX messages to the connection
-// - SSL handshake-only mode for certain services
+// - SSL handshake-only mode for certain services (idevice mode only)
+// - Raw TCP socket mode for iOS 17+ external tunnel connections (no SSL)
 class DTXTransport {
 public:
     // Create transport from an existing idevice connection.
@@ -31,6 +38,18 @@ public:
     // and connecting to it.
     DTXTransport(idevice_t device, lockdownd_service_descriptor_t service,
                  bool sslHandshakeOnly = false);
+
+    // Create transport from a pre-connected raw TCP socket fd.
+    // Takes ownership of the socket; closes it on destruction.
+    // Used for iOS 17+ external tunnel connections (no SSL needed).
+    // On Windows, pass (int)socket where socket is a SOCKET handle.
+    explicit DTXTransport(int socketFd);
+
+    // Connect via TCP to address:port and create a transport.
+    // For iOS 17+ external tunnel connections (no SSL).
+    // address: IPv4 or IPv6 address string
+    // Returns nullptr on failure.
+    static std::unique_ptr<DTXTransport> ConnectTCP(const std::string& address, uint16_t port);
 
     ~DTXTransport();
 
@@ -71,6 +90,9 @@ private:
     uint32_t m_lastReadBytes = 0;
     std::mutex m_sendMutex;
     std::mutex m_recvMutex;
+
+    // Raw TCP socket mode (iOS 17+ external tunnel, value -1 = not in use)
+    int m_socketFd = -1;
 };
 
 } // namespace instruments

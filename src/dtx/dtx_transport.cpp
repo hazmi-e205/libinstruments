@@ -1,6 +1,30 @@
 #include "dtx_transport.h"
 #include "../util/log.h"
 #include <cstring>
+#include <cstdio>
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifdef _MSC_VER
+#pragma comment(lib, "ws2_32.lib")
+#endif
+using socket_t = SOCKET;
+#define SOCKET_INVALID INVALID_SOCKET
+#define CLOSE_SOCKET closesocket
+#else
+#include <sys/socket.h>
+#include <netdb.h>
+#include <unistd.h>
+using socket_t = int;
+#define SOCKET_INVALID (-1)
+#define CLOSE_SOCKET ::close
+#endif
+
+// Undefine Windows API macros that collide with method names
+#ifdef SendMessage
+#undef SendMessage
+#endif
 
 namespace instruments {
 
@@ -52,6 +76,59 @@ DTXTransport::DTXTransport(idevice_t device, lockdownd_service_descriptor_t serv
     }
 }
 
+DTXTransport::DTXTransport(int socketFd)
+    : m_socketFd(socketFd)
+    , m_connected(socketFd >= 0)
+{
+    INST_LOG_DEBUG(TAG, "Created transport from raw socket fd=%d", socketFd);
+}
+
+std::unique_ptr<DTXTransport> DTXTransport::ConnectTCP(const std::string& address, uint16_t port) {
+    INST_LOG_INFO(TAG, "ConnectTCP: connecting to [%s]:%u", address.c_str(), port);
+
+#ifdef _WIN32
+    WSADATA wsaData;
+    WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
+
+    char portStr[8];
+    std::snprintf(portStr, sizeof(portStr), "%u", port);
+
+    struct addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;    // IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+
+    struct addrinfo* res = nullptr;
+    if (getaddrinfo(address.c_str(), portStr, &hints, &res) != 0 || !res) {
+        INST_LOG_ERROR(TAG, "ConnectTCP: getaddrinfo failed for [%s]:%u", address.c_str(), port);
+        return nullptr;
+    }
+
+    socket_t sock = SOCKET_INVALID;
+    for (auto* rp = res; rp != nullptr; rp = rp->ai_next) {
+        sock = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sock == SOCKET_INVALID) continue;
+
+        if (::connect(sock, rp->ai_addr, static_cast<int>(rp->ai_addrlen)) == 0) {
+            break; // connected
+        }
+
+        CLOSE_SOCKET(sock);
+        sock = SOCKET_INVALID;
+    }
+    freeaddrinfo(res);
+
+    if (sock == SOCKET_INVALID) {
+        INST_LOG_ERROR(TAG, "ConnectTCP: failed to connect to [%s]:%u", address.c_str(), port);
+        return nullptr;
+    }
+
+    INST_LOG_INFO(TAG, "ConnectTCP: connected to [%s]:%u", address.c_str(), port);
+    int fd = static_cast<int>(sock);
+    return std::unique_ptr<DTXTransport>(new DTXTransport(fd));
+}
+
 DTXTransport::~DTXTransport() {
     Close();
 }
@@ -61,6 +138,10 @@ void DTXTransport::Close() {
     // Ensure no concurrent Send/Receive is in-flight while closing the connection
     {
         std::scoped_lock<std::mutex, std::mutex> lock(m_recvMutex, m_sendMutex);
+        if (m_socketFd >= 0) {
+            CLOSE_SOCKET(static_cast<socket_t>(m_socketFd));
+            m_socketFd = -1;
+        }
         if (m_connection && m_ownsConnection) {
             idevice_disconnect(m_connection);
         }
@@ -69,6 +150,30 @@ void DTXTransport::Close() {
 }
 
 bool DTXTransport::ReadExact(uint8_t* buffer, size_t length) {
+    // Socket mode (iOS 17+ external tunnel)
+    if (m_socketFd >= 0) {
+        size_t totalRead = 0;
+        while (totalRead < length) {
+            if (!m_connected) return false;
+#ifdef _WIN32
+            int recvLen = recv(static_cast<socket_t>(m_socketFd),
+                reinterpret_cast<char*>(buffer + totalRead),
+                static_cast<int>(length - totalRead), 0);
+#else
+            ssize_t recvLen = recv(m_socketFd,
+                buffer + totalRead,
+                length - totalRead, 0);
+#endif
+            if (recvLen <= 0) {
+                INST_LOG_DEBUG(TAG, "Socket recv returned %d, disconnecting", static_cast<int>(recvLen));
+                m_connected = false;
+                return false;
+            }
+            totalRead += static_cast<size_t>(recvLen);
+        }
+        return true;
+    }
+
     if (!m_connection || !m_connected) return false;
 
     size_t totalRead = 0;
@@ -203,6 +308,30 @@ std::vector<uint8_t> DTXTransport::Receive() {
 
 Error DTXTransport::Send(const uint8_t* data, size_t length) {
     std::lock_guard<std::mutex> lock(m_sendMutex);
+
+    // Socket mode (iOS 17+ external tunnel)
+    if (m_socketFd >= 0) {
+        if (!m_connected) return Error::ConnectionFailed;
+        size_t totalSent = 0;
+        while (totalSent < length) {
+#ifdef _WIN32
+            int sent = ::send(static_cast<socket_t>(m_socketFd),
+                reinterpret_cast<const char*>(data + totalSent),
+                static_cast<int>(length - totalSent), 0);
+#else
+            ssize_t sent = ::send(m_socketFd,
+                data + totalSent,
+                length - totalSent, 0);
+#endif
+            if (sent <= 0) {
+                INST_LOG_ERROR(TAG, "Socket send failed");
+                m_connected = false;
+                return Error::ConnectionFailed;
+            }
+            totalSent += static_cast<size_t>(sent);
+        }
+        return Error::Success;
+    }
 
     if (!m_connection || !m_connected) {
         return Error::ConnectionFailed;

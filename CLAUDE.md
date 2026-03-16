@@ -4,7 +4,7 @@
 
 `libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
 
-**Status**: ✅ DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on **iOS 12 and iOS 15** via USB (as of Feb 2026). Supports iOS 12-17+.
+**Status**: ✅ DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 18+/26+ (iOS 26.2) connection investigated (Mar 2026): USB RSD confirmed CONNREFUSED; USB-NCM auto-connect requires Apple Devices app (Microsoft Store) to install the NCM driver; external CoreDevice tunnel (go-ios / pymobiledevice3) works as fallback.
 
 ## Code Style
 
@@ -173,63 +173,123 @@ void AddGlobalMessageHandler(MessageHandler handler) {
 
 This enables multiple services to coexist on the same connection, each filtering for their specific channel codes.
 
-## iOS 17+ QUIC Tunnel + RSD
+## iOS 17+ RSD (Remote Service Discovery)
 
-### Architecture
+iOS 17+ devices use RSD (Remote Service Discovery) over HTTP/2 + XPC instead of the traditional lockdown-based service discovery. There are three supported paths, in order of preference:
 
+### Path 0: USB CoreDevice QUIC Tunnel (iOS 17.x only) ⚠️ Not applicable to iOS 18+/26+
+
+For iOS 18+ devices where port 58783 is refused via usbmuxd, the library automatically falls back to the CoreDevice QUIC tunnel. This path is triggered automatically when `TryUsbRSD()` fails with `CONNREFUSED`.
+
+**How it works:**
+1. `TryUsbRSD()` fails (iOS 18+/26+) → calls `TryUsbQUIC()`
+2. `TryUsbQUIC()` calls `QUICTunnel::ConnectViaUSB(m_device)`
+3. `ConnectViaUSB` starts `com.apple.internal.dt.coredevice.free.tunnelservice` via lockdown
+4. QUIC handshake runs over the framed lockdown TCP stream (4-byte big-endian length prefix)
+5. JSON parameter exchange (same as Wi-Fi path): clientHandshakeRequest / serverHandshakeResponse
+6. lwIP network initialized with tunnel IPv6 addresses
+7. ForwardLoop thread pumps QUIC ↔ framed stream
+8. `CreateTunnelSocket(serverAddr, rsdPort)` → OS socket pair bridged to lwIP TCP
+9. `ConnectViaFd(fd)` → RSD HTTP/2+XPC handshake to discover service ports
+10. `CreateInstrumentConnection()` USB QUIC branch → `CreateTunnelSocket(serverAddr, servicePort)` → `DTXConnection::CreateFromFd(fd)`
+
+> **iOS 18+/26+ note**: `com.apple.internal.dt.coredevice.free.tunnelservice` is no longer available via lockdownd on iOS 18+. `TryUsbQUIC()` skips this path for `major > 17` and goes directly to `TryNetworkRSD()` → `TryDirectNCMConnection()` → external tool warning.
+
+**Key implementation files (Mar 2026):**
+- `src/connection/tunnel_quic.h/cpp` — `ConnectViaUSB()`, `CreateTunnelSocket()`, `SendFramed()`, `RecvFramedPartial()`, `MakeLoopbackPair()`, `SubmitToLoop()`, `DrainTasks()`, `DrainBridges()`
+- `src/connection/userspace_network.h/cpp` — `m_connectedCb` member + `OnConnected` callback
+- `src/connection/rsd_provider.h/cpp` — `ConnectViaFd(int socketFd)`
+- `include/instruments/dtx_connection.h` + `src/dtx/dtx_connection.cpp` — `CreateFromFd(int socketFd)`
+- `include/instruments/device_connection.h` + `src/connection/device_connection.cpp` — `TryUsbQUIC()`, `m_quicTunnel`, `m_isUsbQuic`
+- `src/connection/tunnel_manager.cpp` — Step 4 USB QUIC attempt after USB RSD failure
+
+**USB stream framing:** 4-byte big-endian length prefix before each QUIC packet (same as `idevice_connection_send/receive`). Non-blocking receive uses `idevice_connection_receive_timeout(..., 0)`.
+
+**Socket bridge architecture:** `MakeLoopbackPair()` creates two connected OS sockets. `fds[0]` returned to caller; `fds[1]` owned by `ForwardLoop`. `DrainBridges()` reads from `fds[1]` → `lwipConn->Send()`. lwIP `RecvCallback` writes to `fds[1]`. All lwIP operations happen on `ForwardLoop` thread via `SubmitToLoop()` task queue.
+
+**Thread safety:** `SubmitToLoop()` queues tasks for the `ForwardLoop` thread. `DrainTasks()` is called at the top of each `ForwardLoop` iteration, ensuring lwIP API calls (like `TcpConnect`) happen on the correct thread.
+
+### Path 1: USB RSD (Auto-detected, opportunistic) ⚠️ Limited
+
+Attempts `idevice_connect(device, 58783)` via usbmuxd TCP forwarding. **Works only on some early iOS 17.x builds.** On iOS 18+ (reported as iOS 26.x), the device returns `CONNREFUSED` (-5) because port 58783 is not exposed via plain usbmuxd TCP forwarding — it requires the CoreDevice QUIC tunnel protocol.
+
+`TryUsbRSD()` is called automatically but fails gracefully on iOS 18+. If it fails, you must use an external tunnel (Path 2).
+
+**Auto-detection**: `DeviceConnection::TryUsbRSD()` is called automatically from all `FromUDID/FromDevice` factory methods. If it succeeds, `m_isUsbRsd=true` and the service port is used directly. If it fails, it logs a warning and falls through.
+
+**How it works**:
+1. `DeviceConnection::FromUDID/FromDevice` calls `TryUsbRSD()` after `DetectProtocol()` returns `RSD`
+2. `TryUsbRSD()` calls `rsd.ConnectViaIDevice(m_device, 58783)` — raw TCP via usbmuxd
+3. `ConnectViaIDevice()` does HTTP/2 SETTINGS + XPC InitHandshake → populates service map
+4. Sets `m_isUsbRsd = true` and `m_isTunnel = true` on success
+5. `CreateInstrumentConnection()` USB RSD branch: `idevice_connect(m_device, servicePort)` to the discovered service port
+
+**Key methods**:
+- `DeviceConnection::TryUsbRSD()` (`src/connection/device_connection.cpp`) — auto-detect, called by all factory methods
+- `RSDProvider::ConnectViaIDevice(idevice_t, port)` (`src/connection/rsd_provider.cpp`) — USB RSD handshake via idevice_connection_send/receive_timeout
+- `RSDProvider::DoRSDHandshake(sendFn, recvFn)` (`src/connection/rsd_provider.cpp`) — shared HTTP/2+XPC logic used by both USB and TCP paths
+
+**TunnelManager behavior** (`TunnelInfo::isUsbDirect = true`):
+```cpp
+TunnelInfo info;
+mgr.StartTunnel(udid, info);
+// info.isUsbDirect == true  → use Instruments::Create(udid), NOT CreateFromTunnel()
+// info.address == ""        → no tunnel address for USB path
+// info.rsdPort == 58783     → RSD port
 ```
-Services (Process, FPS, Perf...)
-    ↕
-DTX Connection (existing)
-    ↕
-DeviceConnection
-    ↕
-RSD Provider (HTTP/2 + XPC handshake, service discovery)
-    ↕
-UserspaceNetwork (lwIP TCP/IP stack, no root needed)
-    ↕
-QUICTunnel (picoquic QUIC + datagram forwarding)
-    ↕
-picoquic → picotls → OpenSSL 1.1.x
+
+### Path 2: External CoreDevice Tunnel (Required for iOS 18+ / iOS 26+) ✅
+
+For USB or Wi-Fi iOS 17+ devices (especially iOS 18+ / iOS 26+), use an external tool to establish the CoreDevice QUIC tunnel first:
+
+```bash
+# go-ios (USB or Wi-Fi):
+ios tunnel start --udid=<UDID>
+# outputs: Tunnel started. Address: fd75:a1b2::1 Port: 58783
+
+# pymobiledevice3 (Wi-Fi):
+python3 -m pymobiledevice3 remote start-tunnel
 ```
 
-### Stack: picoquic + picotls + lwIP
+Then in code:
+```cpp
+// Direct (no TunnelManager needed):
+auto inst = Instruments::CreateFromTunnel("fd75:a1b2::1", 58783, "26.2");
+inst->Process().GetProcessList(procs);
+
+// OR via TunnelManager:
+mgr.RegisterExternalTunnel("UDID", "fd75:a1b2::1", 58783);
+auto tunnels = mgr.GetActiveTunnels();  // list registered tunnels
+```
+
+### Path 3: Built-in QUIC Tunnel (`INSTRUMENTS_HAS_QUIC`)
+
+For Wi-Fi devices without external tools. Enabled via `INSTRUMENTS_HAS_QUIC` build flag.
 
 - **picoquic**: QUIC protocol (RFC 9000) with datagram extension (RFC 9221)
 - **picotls**: TLS 1.3 using OpenSSL 1.1.x backend (no OpenSSL 3.x required)
 - **lwIP**: Userspace TCP/IP stack in NO_SYS mode (bare-metal, manually polled)
 - No root/admin privileges required - all networking in userspace
 
-### Build flag: `INSTRUMENTS_HAS_QUIC`
-
-- Premake5: defined in `Prj/libinstruments.lua`
-- CMake: `-DINSTRUMENTS_HAS_QUIC=ON`
-- Without this flag, tunnel returns `Error::NotSupported` (graceful fallback)
-
-### Tunnel flow
-
+**Tunnel flow**:
 1. `QUICTunnel::Connect()` creates UDP socket, picoquic context, QUIC handshake
 2. Opens stream 0, sends `{"type":"clientHandshakeRequest","mtu":1280}`
 3. Receives `serverHandshakeResponse` with IPv6 addresses + RSD port
 4. Initializes `UserspaceNetwork` (lwIP) with tunnel IPv6 addresses
 5. Starts forwarding thread: QUIC datagrams ↔ lwIP IPv6 packets
-6. `RSDProvider::Connect()` creates lwIP TCP connection to RSD port (58783)
-7. HTTP/2 preface + SETTINGS exchange
-8. XPC InitHandshake → receives service port map
+6. `RSDProvider::ConnectDirect()` creates lwIP TCP connection to RSD port
+7. HTTP/2 SETTINGS + XPC InitHandshake → receives service port map
 
-### Key files
+### Key Files (RSD + Tunnel)
 
-- `src/connection/tunnel_quic.h/cpp` - QUIC tunnel (picoquic)
-- `src/connection/userspace_network.h/cpp` - lwIP bridge
+- `src/connection/rsd_provider.h/cpp` - RSD protocol (HTTP/2 + XPC), shared by all paths
+- `src/connection/device_connection.cpp` - `TryUsbRSD()`, USB RSD branch in `CreateInstrumentConnection()`
+- `src/connection/tunnel_quic.h/cpp` - QUIC tunnel (picoquic, `INSTRUMENTS_HAS_QUIC` only)
+- `src/connection/userspace_network.h/cpp` - lwIP bridge (`INSTRUMENTS_HAS_QUIC` only)
 - `src/connection/http2_framer.h/cpp` - Minimal HTTP/2 framing
-- `src/connection/rsd_provider.h/cpp` - RSD protocol (HTTP/2 + XPC)
 - `src/connection/lwipopts.h` - lwIP configuration
 - `src/connection/arch/cc.h` - lwIP platform config
-
-### Backward compatibility
-
-- `TunnelManager::RegisterExternalTunnel()` works for external tunnel providers
-- External tools: `pymobiledevice3 remote start-tunnel` or `ios tunnel start`
+- `src/connection/sys_arch.c` - lwIP port: provides `sys_now()` (required by LWIP_TIMERS=1)
 
 ## Service Implementation Patterns (iOS 15 Tested)
 
@@ -454,7 +514,14 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 ### 🔄 Implemented But Not Yet Tested
 - Process launch/kill operations
 - Port forwarding
-- iOS 17+ QUIC tunnel support (requires INSTRUMENTS_HAS_QUIC build flag)
+- iOS 17+ USB RSD path: `TryUsbRSD()` / `ConnectViaIDevice()` — **confirmed CONNREFUSED on iOS 26.2 (Mar 2026)**. Port 58783 not accessible via usbmuxd TCP forwarding on iOS 18+. Falls through to `TryUsbQUIC()` automatically.
+- iOS 18+/26+ automatic USB connection — 3-phase fallback in `TryUsbQUIC()`:
+  - Phase 1: `TryNetworkRSD()` — Apple usbmuxd PREFER_NETWORK. Requires "Apple Devices" app (Microsoft Store) to be installed. **Tested on iOS 26.2: no network device found** — Apple Devices app not installed on test machine.
+  - Phase 2: `TryDirectNCMConnection()` — **implemented Mar 2026, requires Apple Devices app**. Enumerates host NICs (Windows: `GetAdaptersAddresses`+`GetIpNetTable2`, Linux: sysfs idVendor+netlink RTM_GETNEIGH), finds Apple USB-NCM adapter (named "Apple Mobile Device Ethernet" etc.), triggers NDP probe (`ff02::1` multicast UDP, no admin), waits 200ms, reads NDP neighbor table. **Tested on iOS 26.2: Apple USB-NCM adapter absent** — Apple Devices app not installed, so no NCM driver/adapter present.
+  - Phase 3: warn user to install Apple Devices app (Windows) or use external CoreDevice tunnel (go-ios / pymobiledevice3).
+  - `TryUsbQUIC()` / `QUICTunnel::ConnectViaUSB()` — iOS 17.x only (lockdown `com.apple.internal.dt.coredevice.free.tunnelservice`), skipped on iOS 18+.
+- **iOS 18+/26+ external tunnel**: `Instruments::CreateFromTunnel("fd61::1", 58783, "26.2")` works when go-ios / pymobiledevice3 tunnel is running. This is the current working path for iOS 26.2.
+- iOS 17+ QUIC tunnel (requires `INSTRUMENTS_HAS_QUIC` build flag) — for Wi-Fi devices
 - XCTest service
 - WDA service
 - iOS 13, 14, 16 versions (protocol design supports them, but not explicitly tested)

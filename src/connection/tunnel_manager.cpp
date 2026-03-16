@@ -7,6 +7,12 @@
 #include <chrono>
 #include <memory>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <unistd.h>
+#endif
+
 namespace instruments {
 
 static const char* TAG = "TunnelManager";
@@ -45,80 +51,131 @@ bool TunnelManager::NeedsTunnel(int majorVersion) {
 Error TunnelManager::StartTunnel(const std::string& udid, TunnelInfo& outInfo) {
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    // Check if tunnel already exists
+    // Return cached tunnel if already active
     auto it = m_tunnels.find(udid);
     if (it != m_tunnels.end()) {
         outInfo = it->second;
         return Error::Success;
     }
 
-    INST_LOG_INFO(TAG, "Starting tunnel for device %s", udid.c_str());
+    INST_LOG_INFO(TAG, "StartTunnel: device %s", udid.c_str());
 
-    // First we need to discover the device and get its tunnel port
+    // ── Step 1: Reach the device via USB ────────────────────────────────────
     idevice_t device = nullptr;
-    idevice_error_t err = idevice_new_with_options(
+    idevice_error_t ierr = idevice_new_with_options(
         &device, udid.c_str(),
         static_cast<idevice_options>(IDEVICE_LOOKUP_USBMUX));
 
-    if (err != IDEVICE_E_SUCCESS) {
-        INST_LOG_ERROR(TAG, "Failed to find device %s: error %d", udid.c_str(), err);
+    if (ierr != IDEVICE_E_SUCCESS || !device) {
+        INST_LOG_ERROR(TAG, "StartTunnel: device %s not found via USB (error %d)",
+                      udid.c_str(), ierr);
         return Error::DeviceNotFound;
     }
 
+    // ── Step 2: Check iOS version ────────────────────────────────────────────
+    std::string version = ServiceConnector::GetIOSVersion(device);
+    if (!NeedsTunnel(version)) {
+        idevice_free(device);
+        INST_LOG_INFO(TAG, "StartTunnel: device %s (iOS %s) does not need a tunnel",
+                     udid.c_str(), version.c_str());
+        return Error::NotSupported;
+    }
+
+    // ── Step 3: Try USB RSD (idevice_connect to port 58783 via usbmuxd) ─────
+    // Reference: go-ios connects directly to RSD port 58783 for USB iOS 17+.
+    // This works because usbmuxd forwards any TCP port to the device.
+    RSDProvider rsd;
+    Error rsdErr = rsd.ConnectViaIDevice(device, RSDProvider::DefaultPort);
+
+    if (rsdErr == Error::Success && !rsd.GetServices().empty()) {
+        INST_LOG_INFO(TAG, "StartTunnel: USB RSD succeeded for %s (iOS %s) — %zu services",
+                     udid.c_str(), version.c_str(), rsd.GetServices().size());
+
+        outInfo.udid = udid;
+        outInfo.address = "";           // empty = USB direct; use Instruments::Create()
+        outInfo.rsdPort = RSDProvider::DefaultPort;
+        outInfo.isUsbDirect = true;
+        m_tunnels[udid] = outInfo;
+
+        auto activeTunnel = std::make_shared<ActiveTunnel>();
+        activeTunnel->info = outInfo;
+        // No QUICTunnel/RSDProvider to keep alive for USB path —
+        // each Instruments::Create() call rediscovers via idevice_connect.
+
+        std::lock_guard<std::mutex> storeLock(s_tunnelStoreMutex);
+        s_activeTunnels[udid] = activeTunnel;
+
+        idevice_free(device);
+        return Error::Success;
+    }
+
     idevice_free(device);
+    INST_LOG_WARN(TAG, "StartTunnel: USB RSD failed for %s (iOS %s): %s",
+                 udid.c_str(), version.c_str(), ErrorToString(rsdErr));
 
-    // Create QUIC tunnel
-    auto tunnel = std::make_unique<QUICTunnel>();
-
-    // For iOS 17+, the tunnel port is typically discovered via lockdownd
-    // or manual pairing. For now we try the default tunnel port.
-    // In practice, the caller should provide the tunnel address/port.
-    Error result = tunnel->Connect("", 0);
-
-    if (result != Error::Success) {
+    // ── Step 4: Try built-in USB QUIC tunnel (iOS 18+ CoreDevice tunnel) ─────
 #ifdef INSTRUMENTS_HAS_QUIC
-        INST_LOG_WARN(TAG, "QUIC tunnel failed: %s", ErrorToString(result));
-        INST_LOG_WARN(TAG, "Ensure device is paired and tunnel address/port is known.");
+    INST_LOG_INFO(TAG, "StartTunnel: trying USB CoreDevice QUIC tunnel for %s...", udid.c_str());
+
+    // Re-open device for QUIC tunnel
+    idevice_t device2 = nullptr;
+    if (idevice_new_with_options(&device2, udid.c_str(),
+            static_cast<idevice_options>(IDEVICE_LOOKUP_USBMUX)) == IDEVICE_E_SUCCESS) {
+
+        auto quicTunnel = std::make_unique<QUICTunnel>();
+        Error quicErr = quicTunnel->ConnectViaUSB(device2);
+        idevice_free(device2);  // always free here; ConnectViaUSB does NOT take ownership
+        device2 = nullptr;
+
+        if (quicErr == Error::Success) {
+            // RSD handshake through the tunnel
+            int rsdFd = quicTunnel->CreateTunnelSocket(
+                quicTunnel->ServerAddress(), quicTunnel->ServerRSDPort());
+            if (rsdFd >= 0) {
+                RSDProvider rsd2;
+                Error rsdErr2 = rsd2.ConnectViaFd(rsdFd);
+#ifdef _WIN32
+                closesocket(static_cast<SOCKET>(rsdFd));
 #else
-        INST_LOG_WARN(TAG, "Built-in QUIC tunnel not available (picoquic not linked).");
+                ::close(rsdFd);
 #endif
-        INST_LOG_WARN(TAG, "Use RegisterExternalTunnel() or start a tunnel externally:");
-        INST_LOG_WARN(TAG, "  pymobiledevice3: python3 -m pymobiledevice3 remote start-tunnel");
-        INST_LOG_WARN(TAG, "  go-ios: ios tunnel start --udid=%s", udid.c_str());
-        return Error::TunnelFailed;
+                if (rsdErr2 == Error::Success && !rsd2.GetServices().empty()) {
+                    INST_LOG_INFO(TAG, "StartTunnel: USB QUIC tunnel succeeded for %s — %zu services",
+                                 udid.c_str(), rsd2.GetServices().size());
+
+                    outInfo.udid = udid;
+                    outInfo.address = quicTunnel->ServerAddress();
+                    outInfo.rsdPort = quicTunnel->ServerRSDPort();
+                    outInfo.isUsbDirect = false;
+                    m_tunnels[udid] = outInfo;
+
+                    auto activeTunnel = std::make_shared<ActiveTunnel>();
+                    activeTunnel->quicTunnel = std::move(quicTunnel);
+                    activeTunnel->info = outInfo;
+
+                    std::lock_guard<std::mutex> storeLock(s_tunnelStoreMutex);
+                    s_activeTunnels[udid] = activeTunnel;
+
+                    return Error::Success;
+                }
+            }
+        } else {
+            INST_LOG_WARN(TAG, "StartTunnel: USB QUIC tunnel failed for %s: %s",
+                         udid.c_str(), ErrorToString(quicErr));
+        }
     }
+#endif // INSTRUMENTS_HAS_QUIC
 
-    // Perform RSD service discovery
-    auto rsd = std::make_unique<RSDProvider>();
-    result = rsd->Connect(tunnel->ServerAddress(), tunnel->ServerRSDPort(),
-                          tunnel->GetNetwork());
+    // ── Step 5: Suggest external tunnel ──────────────────────────────────────
+#ifndef INSTRUMENTS_HAS_QUIC
+    INST_LOG_WARN(TAG, "StartTunnel: built-in QUIC tunnel not available (build without INSTRUMENTS_HAS_QUIC).");
+#endif
+    INST_LOG_WARN(TAG, "StartTunnel: no automatic tunnel available for %s. "
+                 "Use RegisterExternalTunnel() with an external tool:", udid.c_str());
+    INST_LOG_WARN(TAG, "  pymobiledevice3: python3 -m pymobiledevice3 remote start-tunnel");
+    INST_LOG_WARN(TAG, "  go-ios: ios tunnel start --udid=%s", udid.c_str());
 
-    if (result != Error::Success) {
-        INST_LOG_ERROR(TAG, "RSD service discovery failed: %s", ErrorToString(result));
-        tunnel->Close();
-        return Error::TunnelFailed;
-    }
-
-    INST_LOG_INFO(TAG, "Tunnel established for %s: %s:%u (%zu services)",
-                 udid.c_str(), tunnel->ServerAddress().c_str(),
-                 tunnel->ServerRSDPort(), rsd->GetServices().size());
-
-    // Store tunnel info
-    outInfo.udid = udid;
-    outInfo.address = tunnel->ServerAddress();
-    outInfo.rsdPort = tunnel->ServerRSDPort();
-    m_tunnels[udid] = outInfo;
-
-    // Keep the tunnel objects alive
-    auto activeTunnel = std::make_shared<ActiveTunnel>();
-    activeTunnel->quicTunnel = std::move(tunnel);
-    activeTunnel->rsdProvider = std::move(rsd);
-    activeTunnel->info = outInfo;
-
-    std::lock_guard<std::mutex> storeLock(s_tunnelStoreMutex);
-    s_activeTunnels[udid] = activeTunnel;
-
-    return Error::Success;
+    return Error::TunnelFailed;
 }
 
 void TunnelManager::RegisterExternalTunnel(const std::string& udid,

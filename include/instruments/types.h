@@ -104,9 +104,10 @@ struct TestResult {
 
 // Tunnel information
 struct TunnelInfo {
-    std::string address;        // IPv6 address
+    std::string address;        // IPv6 address (empty if isUsbDirect)
     uint16_t rsdPort = 0;       // RSD port on tunnel
     std::string udid;
+    bool isUsbDirect = false;   // true = USB RSD via usbmuxd (use Instruments::Create, not CreateFromTunnel)
 };
 
 // Callback types

@@ -19,6 +19,10 @@ public:
     // Determine the testmanagerd service name
     static std::string GetTestManagerServiceName(IOSProtocol protocol);
 
+    // Undefine Windows API macro that collides with method names
+#ifdef StartService
+#undef StartService
+#endif
     // Start a lockdown service by name.
     // Tries each service name in order until one succeeds.
     // If lockdown is provided, uses it; otherwise creates a temporary client.

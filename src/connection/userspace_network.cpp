@@ -60,12 +60,14 @@ err_t UserspaceTcpConnection::OnConnected(void* arg, tcp_pcb* tpcb, err_t err) {
     if (err != ERR_OK) {
         INST_LOG_ERROR(TAG, "TCP connect failed: %d", err);
         conn->m_connected.store(false);
+        if (conn->m_connectedCb) conn->m_connectedCb(false);
         if (conn->m_errorCb) conn->m_errorCb(Error::ConnectionFailed);
         return ERR_OK;
     }
 
     INST_LOG_INFO(TAG, "TCP connection established");
     conn->m_connected.store(true);
+    if (conn->m_connectedCb) conn->m_connectedCb(true);
     return ERR_OK;
 }
 

@@ -17,6 +17,11 @@
 #include <libimobiledevice/libimobiledevice.h>
 #include <libimobiledevice/lockdown.h>
 
+// Undefine Windows API macros that collide with method names
+#ifdef SendMessage
+#undef SendMessage
+#endif
+
 namespace instruments {
 
 class DTXTransport;
@@ -41,6 +46,18 @@ public:
     static std::unique_ptr<DTXConnection> Create(
         idevice_t device, lockdownd_service_descriptor_t service,
         bool sslHandshakeOnly = false);
+
+    // Create by connecting via raw TCP socket (for iOS 17+ external tunnel).
+    // address: IPv4 or IPv6 address of the device inside the tunnel
+    // port: service port discovered via RSD
+    // No SSL — the tunnel provides transport-level encryption.
+    static std::unique_ptr<DTXConnection> CreateFromTCP(
+        const std::string& address, uint16_t port);
+
+    // Create from a pre-connected OS socket fd.
+    // Takes ownership of the socket; closes it when done.
+    // Used for iOS 17+ USB QUIC tunnel connections (CreateTunnelSocket).
+    static std::unique_ptr<DTXConnection> CreateFromFd(int socketFd);
 
     ~DTXConnection();
 

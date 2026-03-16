@@ -1,8 +1,8 @@
 # libinstruments
 
-A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS < 17 via USB, iOS 17+ via QUIC tunnel (picoquic + picotls + lwIP).
+A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS 12-16 via USB/network and iOS 17+ via USB RSD, USB-NCM (iOS 18+/26+), or external CoreDevice tunnel.
 
-**Status**: ✅ DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on **iOS 12 and iOS 15** via USB. Supports iOS 12-17+.
+**Status**: ✅ DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 18+/26+ (iOS 26.2) connection investigated (Mar 2026) — see iOS 18+/26+ section below.
 
 ## Features
 
@@ -22,7 +22,9 @@ A standalone, pure C++20 library for communicating with iOS Instruments services
 - **Port Forwarding** - TCP relay between host and device
 - **XCTest Runner** - Execute XCTest bundles with test result callbacks
 - **WebDriverAgent** - Launch WDA with automatic port forwarding (HTTP + MJPEG)
-- **iOS 17+ QUIC Tunnel** - Full tunnel support via picoquic + picotls + lwIP (no root needed)
+- **iOS 17+ USB RSD** - Direct USB connection to RSD port 58783 via usbmuxd — auto-detected; confirmed **CONNREFUSED on iOS 18+/26+** (port 58783 not accessible without CoreDevice tunnel)
+- **iOS 18+/26+ USB-NCM auto-connect** - 3-phase fallback: (1) Apple usbmuxd PREFER_NETWORK, (2) Direct NCM IPv6 TCP via host NIC adapter enumeration + NDP. Both require **Apple Devices app** (Microsoft Store) to install the Apple Mobile Device NCM driver. Confirmed not available without it on iOS 26.2 (Mar 2026).
+- **iOS 17+ QUIC Tunnel** - Wi-Fi tunnel via picoquic + picotls + lwIP for wireless devices (no root needed)
 
 ## Dependencies
 
@@ -230,50 +232,77 @@ if (err != Error::Success) {
 }
 ```
 
-### iOS 17+ QUIC Tunnel (🔄 Not Yet Tested)
+### iOS 17+, iOS 18+/26+ Support
 
-iOS 17+ requires a QUIC tunnel for instruments communication. Enable with `INSTRUMENTS_HAS_QUIC` build flag.
+iOS 17+ uses RSD (Remote Service Discovery) over HTTP/2 + XPC. Connection strategy depends on iOS version and installed software.
 
-**Stack**: picoquic (QUIC + datagrams) → picotls (TLS 1.3) → OpenSSL 1.1.x, with lwIP as a userspace TCP/IP stack (no root/admin privileges required).
+#### iOS 17.x — USB RSD (Automatic)
 
-**Tunnel flow**:
-1. QUIC handshake over UDP → stream 0 clientHandshakeRequest
-2. Receives serverHandshakeResponse with IPv6 addresses + RSD port
-3. lwIP initializes userspace TCP/IP with tunnel IPv6
-4. QUIC datagrams forwarded bidirectionally as lwIP IPv6 packets
-5. RSD provider connects via lwIP TCP → HTTP/2 + XPC handshake → service discovery
+For USB-connected iOS 17.x devices, `idevice_connect()` to port 58783 works via usbmuxd. Auto-detected by all `FromUDID/FromDevice` factory methods.
 
 ```cpp
-// Start a QUIC tunnel to an iOS 17+ device
-TunnelManager mgr;
-mgr.StartTunnel("UDID");
+// Transparently handles iOS 17.x USB via RSD:
+auto inst = Instruments::Create("DEVICE-UDID");
+inst->Process().GetProcessList(procs);
+```
 
-// Or register an external tunnel (pymobiledevice3, ios tunnel start)
-mgr.RegisterExternalTunnel("UDID", "fd75:a1b2::1", 60789);
+#### iOS 18+/26+ — Requires Apple Devices App or External Tunnel
 
-auto tunnels = mgr.GetActiveTunnels();
-for (const auto& t : tunnels) {
-    printf("%s -> %s:%u\n", t.udid.c_str(), t.address.c_str(), t.rsdPort);
-}
+iOS 18+ (reported as iOS 26+ with Apple's 2025 versioning) moved CoreDevice out of lockdownd. Port 58783 returns `CONNREFUSED` via plain usbmuxd TCP forwarding. Three automatic paths are attempted in order:
+
+**Phase 1: Apple usbmuxd PREFER_NETWORK** (`TryNetworkRSD`)
+Works when "Apple Devices" app (Microsoft Store / Windows) has activated the USB-NCM tunnel. Apple's usbmuxd registers iOS 18+ devices with their USB-NCM IPv6 address, making `IDEVICE_LOOKUP_PREFER_NETWORK` return a direct TCP device.
+
+**Phase 2: Direct USB-NCM IPv6 TCP** (`TryDirectNCMConnection`)
+Enumerates host network adapters for Apple USB-NCM interface, gets device link-local IPv6 from NDP neighbor table, connects directly via TCP. No admin, no libusb — same approach as go-ios. **Requires Apple Devices app** to install the Apple Mobile Device NCM driver.
+
+> **Windows prerequisite**: Install [Apple Devices](https://apps.microsoft.com/detail/9NP83LWLPZ9K) from the Microsoft Store. This installs the Apple Mobile Device NCM driver that creates the USB-NCM virtual Ethernet adapter. Without it, no USB-NCM adapter exists and both Phase 1 and Phase 2 fail.
+
+**Phase 3 fallback**: If both automatic paths fail, the library logs instructions to use an external CoreDevice tunnel:
+
+```bash
+# go-ios:
+ios tunnel start --udid=<UDID>
+# outputs: Tunnel started. Address: fd61:a1b2::1 Port: 58783
+
+# pymobiledevice3:
+python3 -m pymobiledevice3 remote start-tunnel
+```
+
+Then connect via tunnel address:
+```cpp
+auto inst = Instruments::CreateFromTunnel("fd61:a1b2::1", 58783, "26.2");
+inst->Process().GetProcessList(procs);
+```
+
+Or using the CLI tool:
+```bash
+instruments-cli process list --address fd61:a1b2::1 --rsd-port 58783
 ```
 
 ### CLI Tool
 
 ```bash
-# List processes
+# List processes (USB, iOS 12-17.x)
 instruments-cli process list --udid <UDID>
+
+# List processes via external tunnel (iOS 17+, including iOS 18+/26+)
+instruments-cli process list --address <IPv6> --rsd-port 58783
 
 # Launch an app
 instruments-cli process launch --udid <UDID> --bundle com.example.app
+instruments-cli process launch --address <IPv6> --rsd-port 58783 --bundle com.example.app
 
 # Kill a process
 instruments-cli process kill --udid <UDID> --pid 1234
 
 # Monitor FPS
 instruments-cli fps --udid <UDID> --interval 1000
+instruments-cli fps --address <IPv6> --rsd-port 58783 --interval 1000
 
 # Monitor performance
 instruments-cli perf --udid <UDID> --interval 1000
+instruments-cli perf --address <IPv6> --rsd-port 58783 --interval 1000
 
 # Run XCTest
 instruments-cli xctest --udid <UDID> --bundle com.example.app --runner com.example.appUITests.xctrunner
@@ -284,7 +313,7 @@ instruments-cli wda --udid <UDID> --bundle com.facebook.WebDriverAgentRunner.xct
 # Port forwarding
 instruments-cli forward --udid <UDID> --host-port 8080 --device-port 80
 
-# Tunnel management (iOS 17+)
+# Tunnel management
 instruments-cli tunnel list
 instruments-cli tunnel start --udid <UDID>
 
@@ -363,7 +392,7 @@ Payload: NSKeyedArchiver-encoded selector or return value
 |---|---|---|---|
 | 12-13 | Legacy | `com.apple.instruments.remoteserver` | Handshake-only (auth then plaintext DTX) |
 | 14-16 | Modern | `com.apple.instruments.remoteserver.DVTSecureSocketProxy` | Full SSL encryption |
-| 17+ | RSD | `com.apple.instruments.dtservicehub` | No SSL (QUIC tunnel encrypts) |
+| 17+ | RSD | `com.apple.instruments.dtservicehub` | No SSL (USB usbmuxd or QUIC tunnel provides transport security) |
 
 **How it works:**
 1. Library detects iOS version via lockdown (`ProductVersion` key)

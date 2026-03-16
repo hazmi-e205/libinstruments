@@ -27,11 +27,13 @@ static void PrintUsage(const char* prog) {
         "  xctest             Run XCTest bundle\n"
         "  wda                Run WebDriverAgent\n"
         "  tunnel list        List active tunnels\n"
-        "  tunnel start       Start a tunnel for a device\n"
+        "  tunnel start       Start a tunnel for a device (iOS 17+ USB: no external tools needed)\n"
         "  forward            Forward a port\n"
         "\n"
         "Global options:\n"
-        "  --udid <UDID>      Target device UDID\n"
+        "  --udid <UDID>      Target device UDID (iOS 12-17.x USB)\n"
+        "  --address <IPv6>   Tunnel address for iOS 17+/18+/26+ (from go-ios or pymobiledevice3)\n"
+        "  --rsd-port <port>  RSD port for tunnel (default: 58783)\n"
         "  --verbose          Enable debug logging\n"
         "  --quiet            Suppress info logging\n"
         "\n", prog);
@@ -42,6 +44,8 @@ struct CLIArgs {
     std::string command;
     std::string subcommand;
     std::string udid;
+    std::string tunnelAddress;  // IPv6/IPv4 address for CreateFromTunnel
+    uint16_t rsdPort = 58783;   // RSD port (default 58783)
     std::string bundleId;
     std::string testRunnerBundleId;
     std::string xctestConfig;
@@ -73,6 +77,10 @@ static CLIArgs ParseArgs(int argc, char* argv[]) {
         std::string opt = argv[i];
         if (opt == "--udid" && i + 1 < argc) {
             args.udid = argv[++i];
+        } else if (opt == "--address" && i + 1 < argc) {
+            args.tunnelAddress = argv[++i];
+        } else if (opt == "--rsd-port" && i + 1 < argc) {
+            args.rsdPort = static_cast<uint16_t>(std::atoi(argv[++i]));
         } else if (opt == "--bundle" && i + 1 < argc) {
             args.bundleId = argv[++i];
         } else if (opt == "--runner" && i + 1 < argc) {
@@ -102,10 +110,15 @@ static CLIArgs ParseArgs(int argc, char* argv[]) {
 }
 
 static std::shared_ptr<Instruments> ConnectDevice(const CLIArgs& args) {
+    if (!args.tunnelAddress.empty()) {
+        // Connect via external CoreDevice tunnel (iOS 17+, including iOS 18+/26+)
+        // Requires go-ios `ios tunnel start` or pymobiledevice3 `remote start-tunnel`
+        return Instruments::CreateFromTunnel(args.tunnelAddress, args.rsdPort);
+    }
     if (!args.udid.empty()) {
         return Instruments::Create(args.udid);
     }
-    fprintf(stderr, "Error: --udid required\n");
+    fprintf(stderr, "Error: --udid <UDID> or --address <IPv6> required\n");
     return nullptr;
 }
 
@@ -341,9 +354,11 @@ static int CmdTunnel(const CLIArgs& args) {
         if (tunnels.empty()) {
             printf("No active tunnels\n");
         } else {
-            printf("%-40s %-40s %s\n", "UDID", "Address", "RSD Port");
+            printf("%-40s %-8s %-40s %s\n", "UDID", "Type", "Address", "RSD Port");
             for (const auto& t : tunnels) {
-                printf("%-40s %-40s %u\n", t.udid.c_str(), t.address.c_str(), t.rsdPort);
+                const char* type = t.isUsbDirect ? "USB-RSD" : "Tunnel";
+                const char* addr = t.isUsbDirect ? "(USB direct)" : t.address.c_str();
+                printf("%-40s %-8s %-40s %u\n", t.udid.c_str(), type, addr, t.rsdPort);
             }
         }
         return 0;
@@ -360,8 +375,13 @@ static int CmdTunnel(const CLIArgs& args) {
             fprintf(stderr, "Error: %s\n", ErrorToString(err));
             return 1;
         }
-        printf("Tunnel started: %s -> %s:%u\n",
-               info.udid.c_str(), info.address.c_str(), info.rsdPort);
+        if (info.isUsbDirect) {
+            printf("Tunnel started (USB RSD): %s -> port %u (use Instruments::Create)\n",
+                   info.udid.c_str(), info.rsdPort);
+        } else {
+            printf("Tunnel started: %s -> %s:%u\n",
+                   info.udid.c_str(), info.address.c_str(), info.rsdPort);
+        }
         return 0;
     }
 

@@ -19,6 +19,9 @@
 #include <sys/socket.h>
 #endif
 
+#include <libimobiledevice/libimobiledevice.h>
+#include <libimobiledevice/lockdown.h>
+
 #ifdef INSTRUMENTS_HAS_QUIC
 #include <picoquic.h>
 #endif
@@ -35,26 +38,35 @@ struct TunnelParameters {
 
 // QUICTunnel - establishes a QUIC tunnel to an iOS 17+ device.
 //
-// The tunnel flow (using picoquic + lwIP userspace networking):
-// 1. Connect to device tunnel port via QUIC (picoquic)
-// 2. Open a bidirectional stream for parameter exchange
-// 3. Send clientHandshakeRequest with MTU
-// 4. Receive serverHandshakeResponse with addresses and RSD port
-// 5. Initialize UserspaceNetwork (lwIP) with tunnel addresses
-// 6. Forward QUIC datagrams ↔ lwIP IPv6 packets
+// Supports two transport modes:
+//   Wi-Fi (UDP):  Connect(address, port)      - picoquic over UDP socket
+//   USB (stream): ConnectViaUSB(device)        - picoquic over framed lockdown stream
 //
-// No root/admin privileges required - uses userspace TCP/IP stack.
+// After connect, CreateTunnelSocket(destIPv6, port) returns an OS socket fd
+// bridged through the lwIP TCP stack to the device. The fd is a normal connected
+// socket usable by DTXTransport, RSDProvider, etc.
+//
+// iOS 18+/26+ USB path uses TryDirectNCMConnection() in DeviceConnection — no
+// tunnel, no QUIC, no libusb required.
 class QUICTunnel {
 public:
     QUICTunnel();
     ~QUICTunnel();
 
-    // Connect to the device's tunnel port
-    // address: IPv6 link-local address of the device
-    // tunnelPort: port for tunnel connection (from RSD or manual pairing)
+    // Connect to the device's tunnel port over Wi-Fi/network (UDP)
     Error Connect(const std::string& address, uint16_t tunnelPort);
 
-    // Get tunnel parameters (valid after Connect succeeds)
+    // Connect via USB using the CoreDevice tunnel service (iOS 17+ USB)
+    // Starts "com.apple.internal.dt.coredevice.free.tunnelservice" lockdown service,
+    // runs QUIC over the framed TCP stream.
+    Error ConnectViaUSB(idevice_t device);
+
+    // Create a TCP socket to [destIPv6]:port through the tunnel.
+    // Returns a pre-connected OS socket fd (caller owns it, must close).
+    // Returns -1 on error. Thread-safe.
+    int CreateTunnelSocket(const std::string& destIPv6, uint16_t port);
+
+    // Get tunnel parameters (valid after Connect/ConnectViaUSB succeeds)
     const TunnelParameters& GetParameters() const { return m_params; }
 
     // Close the tunnel
@@ -76,12 +88,39 @@ private:
     std::thread m_forwardThread;
     UserspaceNetwork m_network;
 
+    // USB stream state (always present; only used when m_isUsb = true)
+    bool m_isUsb = false;
+    idevice_connection_t m_idevConn = nullptr;
+    std::vector<uint8_t> m_streamRecvBuf;  // partial packet buffer for USB framing
+
+    // Fake sockaddr for USB path (picoquic needs addresses even over stream)
+    struct sockaddr_storage m_fakeLocalAddr;
+    struct sockaddr_storage m_fakeRemoteAddr;
+
+    // Task queue: SubmitToLoop() allows any thread to schedule work on
+    // the ForwardLoop thread (required for lwIP thread safety)
+    std::mutex m_taskMutex;
+    std::vector<std::function<void()>> m_pendingTasks;
+    void SubmitToLoop(std::function<void()> fn);
+    void DrainTasks();  // called from ForwardLoop
+
+    // Socket bridges: OS socket pair <-> lwIP TCP connection
+    struct SocketBridge {
+        int externalFd = -1;  // fds[0]: returned to caller
+        int internalFd = -1;  // fds[1]: owned by ForwardLoop
+        std::shared_ptr<UserspaceTcpConnection> lwipConn;
+        std::atomic<bool> connected{false};
+    };
+    std::mutex m_bridgeMutex;
+    std::vector<std::shared_ptr<SocketBridge>> m_bridges;
+    void DrainBridges();  // called from ForwardLoop
+
 #ifdef INSTRUMENTS_HAS_QUIC
     picoquic_quic_t* m_quic = nullptr;
     picoquic_cnx_t* m_cnx = nullptr;
-    int m_udpSocket = -1;
+    int m_udpSocket = -1;  // UDP mode only; -1 for USB mode
 
-    // Datagram queue for outgoing packets (lwIP → QUIC)
+    // Datagram queue for outgoing packets (lwIP -> QUIC)
     std::mutex m_dgMutex;
     std::vector<std::vector<uint8_t>> m_outgoingDatagrams;
 
@@ -97,8 +136,15 @@ private:
     // Forwarding loop (runs in m_forwardThread)
     void ForwardLoop();
 
-    // Create and bind UDP socket
+    // Create and bind UDP socket (Wi-Fi mode)
     Error CreateUdpSocket(const struct sockaddr* addr, socklen_t addrLen);
+
+    // USB stream framing helpers (iOS 17.x lockdown stream: 4B BE length prefix)
+    Error SendFramed(const uint8_t* buf, size_t len);
+    int RecvFramedPartial(uint8_t* buf, size_t maxLen);  // returns pkt len or 0
+
+    // Create OS socket pair for CreateTunnelSocket (platform-specific)
+    static int MakeLoopbackPair(int fds[2]);
 #endif
 };
 

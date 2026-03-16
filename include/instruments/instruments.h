@@ -48,6 +48,19 @@ public:
     // Reuses the provided lockdown client instead of creating a new one
     static std::shared_ptr<Instruments> Create(idevice_t device, lockdownd_client_t lockdown);
 
+    // Factory: create from an external tunnel (iOS 17+).
+    // Start a tunnel externally first:
+    //   pymobiledevice3: python3 -m pymobiledevice3 remote start-tunnel
+    //   go-ios:          ios tunnel start
+    // Then pass the address and RSD port printed by that command.
+    // address:    IPv6 address of the device inside the tunnel
+    // rsdPort:    RSD port (default 58783)
+    // iosVersion: iOS version string for protocol selection (default "17.0")
+    static std::shared_ptr<Instruments> CreateFromTunnel(
+        const std::string& address,
+        uint16_t rsdPort = 58783,
+        const std::string& iosVersion = "17.0");
+
     // Access individual services (lazy-initialized)
     ProcessService& Process();
     PerformanceService& Performance();

@@ -7,6 +7,11 @@
 #include <libimobiledevice/libimobiledevice.h>
 #include <thread>
 
+// Undefine Windows API macros that collide with method names
+#ifdef SendMessage
+#undef SendMessage
+#endif
+
 namespace instruments {
 
 static const char* TAG = "DTXConnection";
@@ -33,6 +38,27 @@ std::unique_ptr<DTXConnection> DTXConnection::Create(
     bool sslHandshakeOnly) {
     auto transport = std::make_unique<DTXTransport>(device, service, sslHandshakeOnly);
     if (!transport->IsConnected()) return nullptr;
+    return std::unique_ptr<DTXConnection>(new DTXConnection(std::move(transport)));
+}
+
+std::unique_ptr<DTXConnection> DTXConnection::CreateFromTCP(
+    const std::string& address, uint16_t port) {
+    INST_LOG_INFO(TAG, "CreateFromTCP: connecting to [%s]:%u", address.c_str(), port);
+    auto transport = DTXTransport::ConnectTCP(address, port);
+    if (!transport || !transport->IsConnected()) {
+        INST_LOG_ERROR(TAG, "CreateFromTCP: failed to connect");
+        return nullptr;
+    }
+    return std::unique_ptr<DTXConnection>(new DTXConnection(std::move(transport)));
+}
+
+std::unique_ptr<DTXConnection> DTXConnection::CreateFromFd(int socketFd) {
+    INST_LOG_INFO(TAG, "CreateFromFd: creating DTX connection from socket fd %d", socketFd);
+    auto transport = std::make_unique<DTXTransport>(socketFd);
+    if (!transport->IsConnected()) {
+        INST_LOG_ERROR(TAG, "CreateFromFd: transport not connected");
+        return nullptr;
+    }
     return std::unique_ptr<DTXConnection>(new DTXConnection(std::move(transport)));
 }
 

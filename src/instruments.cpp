@@ -35,6 +35,13 @@ std::shared_ptr<Instruments> Instruments::Create(idevice_t device, lockdownd_cli
     return std::shared_ptr<Instruments>(new Instruments(std::move(connection)));
 }
 
+std::shared_ptr<Instruments> Instruments::CreateFromTunnel(
+    const std::string& address, uint16_t rsdPort, const std::string& iosVersion) {
+    auto connection = DeviceConnection::FromTunnel(address, rsdPort, iosVersion);
+    if (!connection) return nullptr;
+    return std::shared_ptr<Instruments>(new Instruments(std::move(connection)));
+}
+
 ProcessService& Instruments::Process() {
     if (!m_process) {
         m_process = std::make_unique<ProcessService>(m_connection);
