@@ -1,0 +1,144 @@
+name: libinstruments CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  PICOTLS_COMMIT: 5a4461d8a3948d9d26bf861e7d90cb80d8093515
+  PICOQUIC_COMMIT: 3335f4029b55f59a4868cacf3e92c3fb84982115
+  LWIP_COMMIT: 4599f551dead9eac233b91c0b9ee5879f5d0620a
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04-large
+            name: Linux
+            quic: false
+          - os: windows-latest-large
+            name: Windows
+            quic: false
+          - os: ubuntu-22.04-large
+            name: Linux (QUIC)
+            quic: true
+          - os: windows-latest-large
+            name: Windows (QUIC)
+            quic: true
+
+    runs-on: ${{ matrix.os }}
+    name: Build on ${{ matrix.name }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    # ── Linux: system deps ────────────────────────────────────────────────
+    - name: Install Linux system dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y \
+          cmake ninja-build pkg-config \
+          autoconf automake libtool \
+          libplist-dev \
+          libusbmuxd-dev \
+          libimobiledevice-dev \
+          libssl-dev
+
+    - name: Build libimobiledevice-glue from source (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        # libimobiledevice-glue is not packaged in Ubuntu 22.04
+        git clone --depth=1 https://github.com/libimobiledevice/libimobiledevice-glue.git /tmp/libimobiledevice-glue
+        cd /tmp/libimobiledevice-glue
+        ./autogen.sh --prefix=/usr/local
+        make -j$(nproc)
+        sudo make install
+        sudo ldconfig
+
+    # ── Windows: MSYS2 ───────────────────────────────────────────────────
+    - name: Set up MSYS2 (Windows)
+      if: runner.os == 'Windows'
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          mingw-w64-x86_64-cmake
+          mingw-w64-x86_64-ninja
+          mingw-w64-x86_64-pkg-config
+          mingw-w64-x86_64-libimobiledevice
+          mingw-w64-x86_64-libimobiledevice-glue
+          mingw-w64-x86_64-openssl
+
+    # ── QUIC deps: clone at pinned commits ───────────────────────────────
+    - name: Clone QUIC dependencies
+      if: matrix.quic
+      shell: bash
+      run: |
+        git clone https://github.com/private-octopus/picotls /tmp/picotls
+        git -C /tmp/picotls checkout ${{ env.PICOTLS_COMMIT }}
+        git -C /tmp/picotls submodule update --init --recursive
+
+        git clone https://github.com/private-octopus/picoquic /tmp/picoquic
+        git -C /tmp/picoquic checkout ${{ env.PICOQUIC_COMMIT }}
+
+        git clone https://github.com/lwip-tcpip/lwip /tmp/lwip
+        git -C /tmp/lwip checkout ${{ env.LWIP_COMMIT }}
+
+    # ── Configure ────────────────────────────────────────────────────────
+    - name: Configure (Linux)
+      if: runner.os == 'Linux' && !matrix.quic
+      run: |
+        cmake -B build -S . \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DINSTRUMENTS_BUILD_TOOL=ON \
+          -DCMAKE_PREFIX_PATH=/usr/local
+
+    - name: Configure (Linux, QUIC)
+      if: runner.os == 'Linux' && matrix.quic
+      run: |
+        cmake -B build -S . \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DINSTRUMENTS_BUILD_TOOL=ON \
+          -DINSTRUMENTS_HAS_QUIC=ON \
+          -DPICOTLS_SOURCE_DIR=/tmp/picotls \
+          -DPICOQUIC_SOURCE_DIR=/tmp/picoquic \
+          -DLWIP_SOURCE_DIR=/tmp/lwip \
+          -DCMAKE_PREFIX_PATH=/usr/local
+
+    - name: Build (Linux)
+      if: runner.os == 'Linux'
+      run: cmake --build build --parallel
+
+    # ── Windows builds (configure + build in one MSYS2 shell) ────────────
+    - name: Configure & Build (Windows)
+      if: runner.os == 'Windows' && !matrix.quic
+      shell: msys2 {0}
+      run: |
+        cmake -B build -S . \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DINSTRUMENTS_BUILD_TOOL=ON
+        cmake --build build --parallel
+
+    - name: Configure & Build (Windows, QUIC)
+      if: runner.os == 'Windows' && matrix.quic
+      shell: msys2 {0}
+      run: |
+        cmake -B build -S . \
+          -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DINSTRUMENTS_BUILD_TOOL=ON \
+          -DINSTRUMENTS_HAS_QUIC=ON \
+          -DPICOTLS_SOURCE_DIR=/tmp/picotls \
+          -DPICOQUIC_SOURCE_DIR=/tmp/picoquic \
+          -DLWIP_SOURCE_DIR=/tmp/lwip
+        cmake --build build --parallel
