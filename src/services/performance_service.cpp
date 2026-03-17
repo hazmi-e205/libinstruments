@@ -191,9 +191,9 @@ Error PerformanceService::Start(const PerfConfig& config,
     auto startMsg = DTXMessage::CreateWithSelector("start");
     response = m_channel->SendMessageSync(startMsg, kStartTimeoutMs);
     if (!response) {
-        if (errorCb) errorCb(Error::Timeout, "start timeout");
-        Stop();
-        return Error::Timeout;
+        // Some iOS versions begin sysmontap streaming without a sync reply.
+        // Continue and process incoming channel/global messages.
+        INST_LOG_WARN(TAG, "sysmontap start timed out, continuing and waiting for stream data");
     }
     INST_LOG_INFO(TAG, "Performance monitoring started (interval=%ums)",
                  actualConfig.sampleIntervalMs);

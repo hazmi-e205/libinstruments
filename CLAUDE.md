@@ -367,11 +367,11 @@ This section records all practical changes made during iOS 26.2 USB bring-up. Ke
 - `ProcessService::GetProcessListDTX()` timeout increased to 15s for large process-list replies on tunnel paths.
 - `FPSService` hardening:
   - bounded probe/start timeouts
-  - explicit error path when `startSamplingAtTimeInterval:` times out
+  - `startSamplingAtTimeInterval:` timeout handled as warning/non-fatal for cross-version compatibility
   - cleanup of partially created channel/connection on startup failure.
 - `PerformanceService` hardening:
   - bounded attribute/config/start timeouts
-  - explicit failure handling for `start`
+  - `start` timeout handled as warning/non-fatal for cross-version compatibility
   - cleanup on startup failure.
 - `Stop()` behavior for FPS/Performance changed to always clean up existing channel/connection resources even when `m_running` is false (prevents leaked receive threads after partial startup failures).
 - `XCTestService` hardening:
@@ -380,6 +380,34 @@ This section records all practical changes made during iOS 26.2 USB bring-up. Ke
 - `WDAService` hardening:
   - reset port-forwarder object if initial port-forward setup fails
   - `Stop()` now also runs when only forwarding resources exist (not only when running/thread-active).
+
+### 10) Detailed dual-compatibility findings (iOS 15 + iOS 26.2)
+
+These were the key cross-version findings from real-device validation:
+
+1. Different startup semantics across iOS versions:
+- iOS 26.2 reliably replies to `runningProcesses` and stream-start flows on the RSD/CDTunnel path.
+- iOS 15 can stream FPS/perf data even when sync `start` reply is delayed/missing.
+- Action taken: treat FPS/perf `start` reply timeout as warning (non-fatal), continue waiting for stream data.
+
+2. Cleanup behavior must not depend only on `m_running`:
+- Partial startup failures can leave channels/connections allocated while `m_running == false`.
+- Action taken: `Stop()` paths in FPS/Performance/XCTest/WDA now clean up resources even in partial-failure states.
+
+3. iOS 15 SSL receive crash during stop:
+- Crash stack showed `SSL_read` via `idevice_connection_receive_timeout` while stopping FPS.
+- Root cause: close/disconnect race with receive thread in idevice (SSL) transport mode.
+- Action taken: split transport close path:
+  - socket mode: close immediately without recv-lock (avoids tunnel deadlock)
+  - idevice mode: close under recv+send locks (prevents SSL use-after-free race).
+
+4. Timeout tuning must be service-specific:
+- Process list can be large (especially on modern systems), so short sync timeout causes false failures.
+- Action taken: increased process list sync timeout; set bounded but practical service timeouts for FPS/perf setup.
+
+5. Final validated matrix:
+- iOS 15 (legacy USB DTX/SSL): process list, FPS, performance: working.
+- iOS 26.2 (USB CDTunnel + RSD + DTX): process list, FPS, performance: working.
 
 ## Service Implementation Patterns (iOS 15 Tested)
 

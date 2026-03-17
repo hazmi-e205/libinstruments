@@ -109,9 +109,9 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
     startMsg->AppendAuxiliary(NSObject(0.0));
     auto response = m_channel->SendMessageSync(startMsg, kStartTimeoutMs);
     if (!response) {
-        if (errorCb) errorCb(Error::Timeout, "startSampling timeout");
-        Stop();
-        return Error::Timeout;
+        // Some iOS versions start streaming without returning a sync response.
+        // Keep the session alive and rely on incoming stream messages.
+        INST_LOG_WARN(TAG, "startSampling timed out, continuing and waiting for stream data");
     }
 
     m_running.store(true);

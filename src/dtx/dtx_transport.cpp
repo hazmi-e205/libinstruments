@@ -146,20 +146,21 @@ DTXTransport::~DTXTransport() {
 
 void DTXTransport::Close() {
     m_connected = false;
-    // IMPORTANT: close socket without waiting for m_recvMutex.
-    // Receive() holds m_recvMutex while blocked in recv(); taking m_recvMutex here
-    // can deadlock Disconnect()->Close()->join(receiveThread).
+    // Socket mode: close without taking m_recvMutex to avoid deadlock when the
+    // receive thread is blocked in recv() while holding m_recvMutex.
     if (m_socketFd >= 0) {
         CLOSE_SOCKET(static_cast<socket_t>(m_socketFd));
         m_socketFd = -1;
+        return;
     }
-    {
-        std::lock_guard<std::mutex> lock(m_sendMutex);
-        if (m_connection && m_ownsConnection) {
-            idevice_disconnect(m_connection);
-        }
-        m_connection = nullptr;
+
+    // idevice/SSL mode: synchronize against in-flight ReadExact()/Receive()
+    // to avoid use-after-free races inside idevice_connection_receive_timeout().
+    std::scoped_lock<std::mutex, std::mutex> lock(m_recvMutex, m_sendMutex);
+    if (m_connection && m_ownsConnection) {
+        idevice_disconnect(m_connection);
     }
+    m_connection = nullptr;
 }
 
 bool DTXTransport::ReadExact(uint8_t* buffer, size_t length) {

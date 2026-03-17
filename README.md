@@ -2,7 +2,7 @@
 
 A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS 12-16 via USB/network and iOS 17+ via USB RSD, USB CDTunnel/CoreDeviceProxy, USB-NCM fallback, or external CoreDevice tunnel.
 
-**Status**: DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 26.2 USB path validated (Mar 2026): built-in CDTunnel + RSD + DTX handshake + process listing, FPS service, and performance service all working.
+**Status**: DTX protocol working - process listing, FPS monitoring, and performance monitoring validated on **iOS 12, iOS 15, and iOS 26.2** via USB. iOS 26.2 uses built-in CDTunnel + RSD + DTX; iOS 15 uses legacy USB DTX/SSL path.
 
 ## Features
 
@@ -108,7 +108,7 @@ printf("iOS: %s\n", info.version.c_str());
 #### Process Management
 
 ```cpp
-// List all running processes (✅ Tested on iOS 15 via USB)
+// List all running processes (validated on iOS 15 and iOS 26.2 via USB)
 std::vector<ProcessInfo> procs;
 Error err = inst->Process().GetProcessList(procs);
 if (err == Error::Success) {
@@ -459,3 +459,4 @@ GNU Affero General Public License v3.0 (AGPL-3.0)
 This program is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version.
 
 See the [LICENSE](LICENSE) file for full details.
+
