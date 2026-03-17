@@ -5,6 +5,8 @@
 namespace instruments {
 
 static const char* TAG = "FPSService";
+static constexpr int kProbeTimeoutMs = 3000;
+static constexpr int kStartTimeoutMs = 10000;
 
 FPSService::FPSService(std::shared_ptr<DeviceConnection> connection)
     : m_connection(std::move(connection))
@@ -33,22 +35,27 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
     m_channel = m_dtxConnection->MakeChannelWithIdentifier(ChannelId::GraphicsOpenGL);
     if (!m_channel) {
         if (errorCb) errorCb(Error::ServiceStartFailed, "Failed to create graphics channel");
+        m_dtxConnection->Disconnect();
+        m_dtxConnection.reset();
         return Error::ServiceStartFailed;
     }
 
     // Query available statistics (optional, for logging)
     auto statsMsg = DTXMessage::CreateWithSelector("availableStatistics");
-    m_channel->SendMessageSync(statsMsg);
+    m_channel->SendMessageSync(statsMsg, kProbeTimeoutMs);
 
     // Query driver names (optional, for logging)
     auto driversMsg = DTXMessage::CreateWithSelector("driverNames");
-    m_channel->SendMessageSync(driversMsg);
+    m_channel->SendMessageSync(driversMsg, kProbeTimeoutMs);
 
     // Set sampling rate
     float rate = static_cast<float>(sampleIntervalMs) / 100.0f;
     auto rateMsg = DTXMessage::CreateWithSelector("setSamplingRate:");
     rateMsg->AppendAuxiliary(NSObject(rate));
-    m_channel->SendMessageSync(rateMsg);
+    auto rateResp = m_channel->SendMessageSync(rateMsg, kProbeTimeoutMs);
+    if (!rateResp) {
+        INST_LOG_WARN(TAG, "setSamplingRate timed out, continuing with device defaults");
+    }
 
     auto parseFpsMessage = [this, callback, errorCb](std::shared_ptr<DTXMessage> msg) {
         if (!m_running.load()) return;
@@ -100,7 +107,12 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
     // Start sampling
     auto startMsg = DTXMessage::CreateWithSelector("startSamplingAtTimeInterval:");
     startMsg->AppendAuxiliary(NSObject(0.0));
-    auto response = m_channel->SendMessageSync(startMsg);
+    auto response = m_channel->SendMessageSync(startMsg, kStartTimeoutMs);
+    if (!response) {
+        if (errorCb) errorCb(Error::Timeout, "startSampling timeout");
+        Stop();
+        return Error::Timeout;
+    }
 
     m_running.store(true);
     INST_LOG_INFO(TAG, "FPS monitoring started (interval=%ums)", sampleIntervalMs);
@@ -109,7 +121,8 @@ Error FPSService::Start(uint32_t sampleIntervalMs,
 }
 
 void FPSService::Stop() {
-    if (!m_running.exchange(false)) return;
+    m_running.store(false);
+    if (!m_channel && !m_dtxConnection) return;
 
     INST_LOG_INFO(TAG, "Stopping FPS monitoring");
 

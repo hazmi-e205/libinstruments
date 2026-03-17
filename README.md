@@ -2,14 +2,14 @@
 
 A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS 12-16 via USB/network and iOS 17+ via USB RSD, USB CDTunnel/CoreDeviceProxy, USB-NCM fallback, or external CoreDevice tunnel.
 
-**Status**: DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 26.2 USB path validated (Mar 2026): built-in CDTunnel + RSD + DTX handshake + `runningProcesses` response working.
+**Status**: DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 26.2 USB path validated (Mar 2026): built-in CDTunnel + RSD + DTX handshake + process listing, FPS service, and performance service all working.
 
 ## Features
 
-### ✅ Tested and Working (iOS 12 & iOS 15)
-- **Process Listing** - Get running processes (tested on iOS 12 & iOS 15 via USB)
-- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl` (tested on iOS 12 & iOS 15 via USB)
-- **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap` (tested on iOS 12 & iOS 15 via USB)
+### ✅ Tested and Working (iOS 12, iOS 15, iOS 26.2)
+- **Process Listing** - Get running processes (tested on iOS 12, iOS 15, and iOS 26.2 via USB)
+- **FPS Monitoring** - Real-time frames-per-second and GPU utilization via `graphics.opengl` (tested on iOS 12, iOS 15, and iOS 26.2 via USB)
+- **Performance Monitoring** - System and per-process CPU, memory, disk, network metrics via `sysmontap` (tested on iOS 12, iOS 15, and iOS 26.2 via USB)
   - Supports multiple iOS data formats: dict-based (Processes key), nested dict (System.processes/ProcessByPid), and array-packed layouts
   - Handles messages on both dedicated channel and global channel (-1)
 - **DTX Protocol** - Handshake, message exchange, channel management, global message routing
@@ -129,7 +129,7 @@ if (err == Error::Success) {
 err = inst->Process().KillProcess(pid);
 ```
 
-#### FPS Monitoring (✅ Tested on iOS 15 via USB)
+#### FPS Monitoring (✅ Tested on iOS 15 and iOS 26.2 via USB)
 
 ```cpp
 // Start FPS monitoring (1000ms interval)
@@ -148,7 +148,7 @@ inst->FPS().Start(1000,
 inst->FPS().Stop();
 ```
 
-#### Performance Monitoring (✅ Tested on iOS 15 via USB)
+#### Performance Monitoring (✅ Tested on iOS 15 and iOS 26.2 via USB)
 
 ```cpp
 // Configure performance monitoring

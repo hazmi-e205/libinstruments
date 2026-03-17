@@ -5,6 +5,7 @@
 namespace instruments {
 
 static const char* TAG = "ProcessService";
+static constexpr int kProcessListTimeoutMs = 15000;
 
 ProcessService::ProcessService(std::shared_ptr<DeviceConnection> connection)
     : m_connection(std::move(connection))
@@ -80,7 +81,7 @@ Error ProcessService::GetProcessListDTX(std::vector<ProcessInfo>& outProcesses) 
     if (!channel) return Error::ServiceStartFailed;
 
     auto msg = DTXMessage::CreateWithSelector("runningProcesses");
-    auto response = channel->SendMessageSync(msg);
+    auto response = channel->SendMessageSync(msg, kProcessListTimeoutMs);
     channel->Cancel();
 
     if (!response) return Error::Timeout;

@@ -6,6 +6,9 @@
 namespace instruments {
 
 static const char* TAG = "PerfService";
+static constexpr int kAttrTimeoutMs = 10000;
+static constexpr int kConfigTimeoutMs = 10000;
+static constexpr int kStartTimeoutMs = 10000;
 
 PerformanceService::PerformanceService(std::shared_ptr<DeviceConnection> connection)
     : m_connection(std::move(connection))
@@ -25,7 +28,7 @@ Error PerformanceService::GetAttributes(const std::string& selector,
     if (!channel) return Error::ServiceStartFailed;
 
     auto msg = DTXMessage::CreateWithSelector(selector);
-    auto response = channel->SendMessageSync(msg);
+    auto response = channel->SendMessageSync(msg, kAttrTimeoutMs);
     channel->Cancel();
 
     if (!response) return Error::Timeout;
@@ -98,6 +101,8 @@ Error PerformanceService::Start(const PerfConfig& config,
     m_channel = m_dtxConnection->MakeChannelWithIdentifier(ChannelId::Sysmontap);
     if (!m_channel) {
         if (errorCb) errorCb(Error::ServiceStartFailed, "Failed to create sysmontap channel");
+        m_dtxConnection->Disconnect();
+        m_dtxConnection.reset();
         return Error::ServiceStartFailed;
     }
 
@@ -148,9 +153,10 @@ Error PerformanceService::Start(const PerfConfig& config,
     // Send setConfig:
     auto setConfigMsg = DTXMessage::CreateWithSelector("setConfig:");
     setConfigMsg->AppendAuxiliary(configObj);
-    auto response = m_channel->SendMessageSync(setConfigMsg);
+    auto response = m_channel->SendMessageSync(setConfigMsg, kConfigTimeoutMs);
     if (!response) {
         if (errorCb) errorCb(Error::Timeout, "setConfig timeout");
+        Stop();
         return Error::Timeout;
     }
 
@@ -183,7 +189,12 @@ Error PerformanceService::Start(const PerfConfig& config,
 
     // Send start
     auto startMsg = DTXMessage::CreateWithSelector("start");
-    response = m_channel->SendMessageSync(startMsg);
+    response = m_channel->SendMessageSync(startMsg, kStartTimeoutMs);
+    if (!response) {
+        if (errorCb) errorCb(Error::Timeout, "start timeout");
+        Stop();
+        return Error::Timeout;
+    }
     INST_LOG_INFO(TAG, "Performance monitoring started (interval=%ums)",
                  actualConfig.sampleIntervalMs);
 
@@ -191,7 +202,8 @@ Error PerformanceService::Start(const PerfConfig& config,
 }
 
 void PerformanceService::Stop() {
-    if (!m_running.exchange(false)) return;
+    m_running.store(false);
+    if (!m_channel && !m_dtxConnection) return;
 
     INST_LOG_INFO(TAG, "Stopping performance monitoring");
 

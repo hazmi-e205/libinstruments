@@ -4,7 +4,7 @@
 
 `libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
 
-**Status**: DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 26.2 USB path validated (Mar 2026): USB CDTunnel/CoreDeviceProxy + RSD + DTX handshake + `runningProcesses` all working. External CoreDevice tunnel (go-ios / pymobiledevice3) remains supported fallback.
+**Status**: DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on **iOS 12, iOS 15, and iOS 26.2** via USB. iOS 26.2 validated path (Mar 2026): USB CDTunnel/CoreDeviceProxy + RSD + DTX handshake + DeviceInfo/graphics.opengl/sysmontap services working. External CoreDevice tunnel (go-ios / pymobiledevice3) remains supported fallback.
 
 ## Code Style
 
@@ -360,6 +360,26 @@ This section records all practical changes made during iOS 26.2 USB bring-up. Ke
 - RSD service discovery succeeds and returns full service map.
 - DTX handshake succeeds on `com.apple.instruments.dtservicehub`.
 - `runningProcesses` / process list request succeeds.
+- `FPSService` and `PerformanceService` start successfully and stream data on iOS 26.2.
+
+### 9) Service-level hardening after iOS 26.2 validation
+
+- `ProcessService::GetProcessListDTX()` timeout increased to 15s for large process-list replies on tunnel paths.
+- `FPSService` hardening:
+  - bounded probe/start timeouts
+  - explicit error path when `startSamplingAtTimeInterval:` times out
+  - cleanup of partially created channel/connection on startup failure.
+- `PerformanceService` hardening:
+  - bounded attribute/config/start timeouts
+  - explicit failure handling for `start`
+  - cleanup on startup failure.
+- `Stop()` behavior for FPS/Performance changed to always clean up existing channel/connection resources even when `m_running` is false (prevents leaked receive threads after partial startup failures).
+- `XCTestService` hardening:
+  - `Run()` now calls `Stop()` on non-success return from `RunWithDTX()`
+  - `Stop()` now also cleans up lingering connections/resources even when `m_running` is false.
+- `WDAService` hardening:
+  - reset port-forwarder object if initial port-forward setup fails
+  - `Stop()` now also runs when only forwarding resources exist (not only when running/thread-active).
 
 ## Service Implementation Patterns (iOS 15 Tested)
 
@@ -561,7 +581,7 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 
 ## Testing Status
 
-### ✅ Verified Working on iOS 12 & iOS 15
+### ✅ Verified Working on iOS 12, iOS 15, and iOS 26.2
 
 **iOS 12.x (Legacy Protocol - Feb 2026)**
 - **Process listing** - GetProcessList() successfully retrieves running processes with PID, name, bundle ID via USB
@@ -580,6 +600,13 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 - **Full SSL encryption** - Verified that `DVTSecureSocketProxy` works with full SSL encryption for all DTX traffic
 - **DTX protocol core** - Handshake, message exchange, channel management, callbacks, global message routing all working
 - **USB connection** - Direct device connection via libimobiledevice
+
+**iOS 26.2 (RSD + CDTunnel Protocol - Mar 2026)**
+- **Process listing** - `GetProcessList()` succeeds end-to-end via CDTunnel/CoreDeviceProxy + RSD + DTX.
+- **FPS monitoring** - `FPSService` starts and streams metrics successfully.
+- **Performance monitoring** - `PerformanceService` starts and streams sysmontap metrics successfully.
+- **RSD + service discovery** - RSD handshake succeeds and discovers full service map.
+- **DTX connection** - Channel creation and sync calls work on `com.apple.instruments.dtservicehub`.
 
 ### 🔄 Implemented But Not Yet Tested
 - Process launch/kill operations

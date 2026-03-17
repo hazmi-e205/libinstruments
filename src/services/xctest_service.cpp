@@ -32,6 +32,9 @@ Error XCTestService::Run(const XCTestConfig& config,
     m_running.store(true);
 
     Error result = RunWithDTX(config, resultCb, logCb, errorCb);
+    if (result != Error::Success) {
+        Stop();
+    }
 
     m_running.store(false);
     return result;
@@ -175,10 +178,12 @@ Error XCTestService::RunWithDTX(const XCTestConfig& config,
 }
 
 void XCTestService::Stop() {
-    if (!m_running.load()) return;
+    const bool hasResources = (m_dtxConnection || m_dtxConnection2 || m_testRunnerPid > 0);
+    if (!m_running.load() && !hasResources) return;
 
     INST_LOG_INFO(TAG, "Stopping XCTest execution");
     m_stopping.store(true);
+    m_running.store(false);
 
     // Kill test runner if running
     if (m_testRunnerPid > 0 && m_connection) {
@@ -190,6 +195,8 @@ void XCTestService::Stop() {
     // Disconnect DTX
     if (m_dtxConnection) m_dtxConnection->Disconnect();
     if (m_dtxConnection2) m_dtxConnection2->Disconnect();
+    m_dtxConnection.reset();
+    m_dtxConnection2.reset();
 }
 
 } // namespace instruments

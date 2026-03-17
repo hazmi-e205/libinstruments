@@ -34,6 +34,7 @@ Error WDAService::Start(const WDAConfig& config,
         INST_LOG_ERROR(TAG, "Failed to forward WDA port %u -> %u",
                       config.wdaPort, config.deviceWdaPort);
         if (errorCb) errorCb(err, "Failed to forward WDA port");
+        m_portForwarder.reset();
         m_running.store(false);
         return err;
     }
@@ -102,7 +103,7 @@ Error WDAService::Start(const WDAConfig& config,
 }
 
 void WDAService::Stop() {
-    if (!m_running.load() && !m_wdaThread.joinable()) return;
+    if (!m_running.load() && !m_wdaThread.joinable() && !m_portForwarder) return;
 
     INST_LOG_INFO(TAG, "Stopping WDA...");
     m_stopping.store(true);
