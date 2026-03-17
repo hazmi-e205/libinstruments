@@ -36,18 +36,21 @@ struct TunnelParameters {
     uint32_t mtu = 1280;          // Maximum transmission unit
 };
 
-// QUICTunnel - establishes a QUIC tunnel to an iOS 17+ device.
+// QUICTunnel - establishes a userspace tunnel to an iOS 17+ device.
 //
-// Supports two transport modes:
-//   Wi-Fi (UDP):  Connect(address, port)      - picoquic over UDP socket
-//   USB (stream): ConnectViaUSB(device)        - picoquic over framed lockdown stream
+// Supports three transport modes:
+//   Wi-Fi (UDP):    Connect(address, port)              - picoquic over UDP socket
+//   USB CDTunnel:   ConnectViaCoreDeviceProxy(device)   - CDTunnel JSON + raw IPv6 TCP (iOS 17.4+, 18+/26+)
+//   USB QUIC:       ConnectViaUSB(device)               - picoquic over framed lockdown stream (iOS 17.x only)
 //
 // After connect, CreateTunnelSocket(destIPv6, port) returns an OS socket fd
 // bridged through the lwIP TCP stack to the device. The fd is a normal connected
 // socket usable by DTXTransport, RSDProvider, etc.
 //
-// iOS 18+/26+ USB path uses TryDirectNCMConnection() in DeviceConnection — no
-// tunnel, no QUIC, no libusb required.
+// Preferred USB path for iOS 17.4+ and all iOS 18+/26+:
+//   ConnectViaCoreDeviceProxy() — uses com.apple.internal.devicecompute.CoreDeviceProxy
+//   lockdown service (standard usbmuxd, works with iTunes). No admin required.
+//   Sends CDTunnel JSON handshake, then pumps raw IPv6 packets over the SSL TCP connection.
 class QUICTunnel {
 public:
     QUICTunnel();
@@ -56,7 +59,13 @@ public:
     // Connect to the device's tunnel port over Wi-Fi/network (UDP)
     Error Connect(const std::string& address, uint16_t tunnelPort);
 
-    // Connect via USB using the CoreDevice tunnel service (iOS 17+ USB)
+    // Connect via USB using CoreDeviceProxy CDTunnel (iOS 17.4+, iOS 18+/26+).
+    // Starts "com.apple.internal.devicecompute.CoreDeviceProxy" lockdown service,
+    // performs CDTunnel JSON handshake, then pumps raw IPv6 packets over SSL TCP.
+    // Works with iTunes (no Apple Devices app required). No admin privileges needed.
+    Error ConnectViaCoreDeviceProxy(idevice_t device);
+
+    // Connect via USB using the CoreDevice QUIC tunnel service (iOS 17.x only).
     // Starts "com.apple.internal.dt.coredevice.free.tunnelservice" lockdown service,
     // runs QUIC over the framed TCP stream.
     Error ConnectViaUSB(idevice_t device);
@@ -88,10 +97,16 @@ private:
     std::thread m_forwardThread;
     UserspaceNetwork m_network;
 
-    // USB stream state (always present; only used when m_isUsb = true)
-    bool m_isUsb = false;
+    // USB stream state (always present)
+    bool m_isUsb = false;        // true for QUIC-over-framed-stream path (iOS 17.x)
+    bool m_isCDTunnel = false;   // true for CDTunnel path (iOS 17.4+, iOS 18+/26+)
     idevice_connection_t m_idevConn = nullptr;
-    std::vector<uint8_t> m_streamRecvBuf;  // partial packet buffer for USB framing
+    std::vector<uint8_t> m_streamRecvBuf;   // partial packet buffer for USB QUIC framing
+    std::vector<uint8_t> m_cdRecvBuf;       // partial IPv6 packet buffer for CDTunnel
+
+    // CDTunnel output queue: lwIP -> device send (locked by m_cdOutputMutex)
+    std::mutex m_cdOutputMutex;
+    std::vector<std::vector<uint8_t>> m_cdOutputQueue;
 
     // Fake sockaddr for USB path (picoquic needs addresses even over stream)
     struct sockaddr_storage m_fakeLocalAddr;
@@ -130,7 +145,10 @@ private:
                             picoquic_call_back_event_t fin_or_event,
                             void* callback_ctx, void* stream_ctx);
 
-    // Handshake: exchange parameters on stream 0
+    // CDTunnel handshake: exchange parameters over CDTunnel JSON protocol
+    Error PerformCDTunnelHandshake();
+
+    // Handshake: exchange parameters on stream 0 (QUIC path)
     Error PerformHandshake();
 
     // Forwarding loop (runs in m_forwardThread)

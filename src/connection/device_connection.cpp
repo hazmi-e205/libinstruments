@@ -378,48 +378,105 @@ static std::vector<NCMCandidate> DiscoverAppleNCMCandidates() {
 
 void DeviceConnection::TryUsbQUIC() {
 #ifdef INSTRUMENTS_HAS_QUIC
+    // Helper: try CDTunnel via CoreDeviceProxy, do RSD handshake, populate services.
+    // Defined as a lambda to keep it scoped and avoid unused-function warnings without QUIC.
+    auto tryCDTunnelAndRSD = [](QUICTunnel& tunnel, idevice_t device,
+                                std::map<std::string, uint16_t>& servicesOut,
+                                std::string& serverAddrOut, uint16_t& rsdPortOut) -> bool {
+        Error err = tunnel.ConnectViaCoreDeviceProxy(device);
+        if (err != Error::Success) return false;
+
+        int rsdFd = tunnel.CreateTunnelSocket(tunnel.ServerAddress(), tunnel.ServerRSDPort());
+        if (rsdFd < 0) {
+            INST_LOG_ERROR("DeviceConnection", "CDTunnel: CreateTunnelSocket for RSD failed");
+            return false;
+        }
+
+        RSDProvider rsd;
+        Error rsdErr = rsd.ConnectViaFd(rsdFd);
+#ifdef _WIN32
+        closesocket(static_cast<SOCKET>(rsdFd));
+#else
+        ::close(rsdFd);
+#endif
+
+        if (rsdErr != Error::Success || rsd.GetServices().empty()) {
+            if (rsdErr == Error::Success) {
+                INST_LOG_WARN("DeviceConnection", "CDTunnel: RSD handshake returned no services");
+            } else {
+                INST_LOG_WARN("DeviceConnection", "CDTunnel: RSD handshake failed: %s",
+                             ErrorToString(rsdErr));
+            }
+            return false;
+        }
+
+        for (const auto& [name, entry] : rsd.GetServices()) {
+            servicesOut[name] = entry.port;
+        }
+        serverAddrOut = tunnel.ServerAddress();
+        rsdPortOut = tunnel.ServerRSDPort();
+        return true;
+    };
+
     if (m_protocol != IOSProtocol::RSD || !m_device) return;
 
-    // iOS 18+ (reported as iOS 26+ with Apple's new versioning) moved the
-    // CoreDevice tunnel service out of lockdownd. The service names we try
-    // via lockdownd_start_service are only registered on iOS 17.x; on iOS 18+
-    // they return LOCKDOWN_E_INVALID_SERVICE. The new protocol uses RemoteXPC
-    // which is not supported by standard libimobiledevice.
-    // Skip the lockdown attempt immediately on iOS 18+ / iOS 26+ and tell the
-    // user to use an external tunnel tool instead.
     int major = 0, minor = 0, patch = 0;
     ServiceConnector::ParseVersion(m_iosVersion, major, minor, patch);
-    // Apple renumbered: iOS 18 = iOS 26 in new versioning (WWDC 2025).
-    // major > 17 covers both old-style "18.x" and new-style "26.x".
+
+    // Phase 0: Try CDTunnel (CoreDeviceProxy) — works on iOS 17.4+, iOS 18+/26+.
+    // Uses standard lockdownd + simple TCP protocol (no QUIC, no admin, no NCM driver).
+    // This is the preferred path and works with iTunes-only (no Apple Devices app).
+    {
+        INST_LOG_INFO(TAG, "iOS %s: trying CDTunnel (com.apple.internal.devicecompute.CoreDeviceProxy)...",
+                     m_iosVersion.c_str());
+        auto cdTunnel = std::make_shared<QUICTunnel>();
+        std::map<std::string, uint16_t> services;
+        std::string serverAddr;
+        uint16_t rsdPort = 0;
+        if (tryCDTunnelAndRSD(*cdTunnel, m_device, services, serverAddr, rsdPort)) {
+            m_quicTunnel = cdTunnel;
+            m_tunnelAddress = serverAddr;
+            m_tunnelRsdPort = rsdPort;
+            m_isTunnel = true;
+            m_isUsbQuic = true;
+            m_rsdServices = std::move(services);
+            INST_LOG_INFO(TAG, "iOS %s CDTunnel active: %zu services discovered",
+                         m_iosVersion.c_str(), m_rsdServices.size());
+            return;
+        }
+        INST_LOG_DEBUG(TAG, "CDTunnel unavailable on iOS %s — trying other methods...",
+                      m_iosVersion.c_str());
+    }
+
     if (major > 17) {
-        // iOS 18+/26+: lockdown no longer hosts CoreDevice tunnel services.
-        // Try USB-NCM network path first (works with Apple's updated usbmuxd).
-        // 1. Try USB-NCM via Apple's usbmuxd (PREFER_NETWORK) —
-        //    works when Apple Devices app has already activated the tunnel.
+        // iOS 18+/26+: CDTunnel should have worked; if it didn't, try USB-NCM approaches.
+        // (CDTunnel is not available if device is not yet trusted, or service is absent.)
+
+        // Phase 1: USB-NCM via Apple's usbmuxd PREFER_NETWORK — requires Apple Devices app.
         INST_LOG_INFO(TAG, "iOS %s: trying USB-NCM network path (Apple usbmuxd)...",
                      m_iosVersion.c_str());
         TryNetworkRSD();
-        if (m_isUsbRsd) return;  // USB-NCM via usbmuxd worked
+        if (m_isUsbRsd) return;
 
-        // 2. Try direct USB-NCM IPv6 TCP — enumerate host network adapters,
-        //    find the Apple USB-NCM interface, get device IPv6 from neighbor
-        //    table, connect directly. Same approach as go-ios, no admin needed.
+        // Phase 2: Direct USB-NCM IPv6 — enumerate host adapters, find Apple NCM interface.
         TryDirectNCMConnection();
         if (m_isDirectNCM) return;
 
-        // 3. Nothing worked: advise the user.
+        // Phase 3: Nothing worked.
         INST_LOG_WARN(TAG, "iOS %s: automatic USB tunnel failed. "
-                     "On Windows, install 'Apple Devices' from the Microsoft Store to enable "
-                     "USB-NCM support (required for iOS 18+ / iOS 26+). "
+                     "CDTunnel requires the device to be trusted (unlocked/paired). "
+                     "On Windows, install 'Apple Devices' from the Microsoft Store for USB-NCM. "
                      "Alternatively, use an external CoreDevice tunnel:\n"
-                     "  go-ios:          ios tunnel start --udid=<UDID>\n"
+                     "  go-ios:          ios tunnel start --userspace --udid=<UDID>\n"
                      "  pymobiledevice3: python3 -m pymobiledevice3 remote start-tunnel\n"
                      "Then call Instruments::CreateFromTunnel(address, port, \"%s\").",
                      m_iosVersion.c_str(), m_iosVersion.c_str());
         return;
     }
 
-    INST_LOG_INFO(TAG, "iOS 17.x: attempting USB CoreDevice QUIC tunnel via lockdown...");
+    // iOS 17.0-17.3: CDTunnel not available — fall back to QUIC over lockdown stream.
+    INST_LOG_INFO(TAG, "iOS %s: CDTunnel unavailable — trying QUIC lockdown tunnel...",
+                 m_iosVersion.c_str());
 
     auto quicTunnel = std::make_shared<QUICTunnel>();
     Error err = quicTunnel->ConnectViaUSB(m_device);
@@ -433,7 +490,6 @@ void DeviceConnection::TryUsbQUIC() {
         return;
     }
 
-    // Do RSD handshake through the tunnel
     int rsdFd = quicTunnel->CreateTunnelSocket(
         quicTunnel->ServerAddress(), quicTunnel->ServerRSDPort());
     if (rsdFd < 0) {
@@ -464,11 +520,11 @@ void DeviceConnection::TryUsbQUIC() {
         m_rsdServices[name] = entry.port;
     }
 
-    INST_LOG_INFO(TAG, "iOS 18+ USB QUIC tunnel active: %zu services discovered",
-                 m_rsdServices.size());
+    INST_LOG_INFO(TAG, "iOS %s USB QUIC tunnel active: %zu services discovered",
+                 m_iosVersion.c_str(), m_rsdServices.size());
 #else
     INST_LOG_WARN(TAG, "TryUsbQUIC: INSTRUMENTS_HAS_QUIC not enabled — "
-                 "cannot use USB CoreDevice QUIC tunnel. "
+                 "cannot use USB CoreDevice tunnel (CDTunnel or QUIC). "
                  "Use an external CoreDevice tunnel instead.");
 #endif
 }

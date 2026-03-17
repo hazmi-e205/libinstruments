@@ -1,8 +1,8 @@
 # libinstruments
 
-A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS 12-16 via USB/network and iOS 17+ via USB RSD, USB-NCM (iOS 18+/26+), or external CoreDevice tunnel.
+A standalone, pure C++20 library for communicating with iOS Instruments services. Supports iOS 12-16 via USB/network and iOS 17+ via USB RSD, USB CDTunnel/CoreDeviceProxy, USB-NCM fallback, or external CoreDevice tunnel.
 
-**Status**: ✅ DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 18+/26+ (iOS 26.2) connection investigated (Mar 2026) — see iOS 18+/26+ section below.
+**Status**: DTX protocol working - process listing, FPS monitoring, and performance monitoring tested on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 26.2 USB path validated (Mar 2026): built-in CDTunnel + RSD + DTX handshake + `runningProcesses` response working.
 
 ## Features
 
@@ -17,13 +17,14 @@ A standalone, pure C++20 library for communicating with iOS Instruments services
 - **SSL Mode Handling** - Version-specific SSL behavior (pre-14: handshake-only, 14-16: full SSL, 17+: no SSL)
 - **Cross-Platform** - Windows, Linux, macOS
 
-### 🔄 Implemented But Not Yet Tested
+### Implemented / Validated
 - **Process Launch/Kill** - Start and terminate processes
 - **Port Forwarding** - TCP relay between host and device
 - **XCTest Runner** - Execute XCTest bundles with test result callbacks
 - **WebDriverAgent** - Launch WDA with automatic port forwarding (HTTP + MJPEG)
-- **iOS 17+ USB RSD** - Direct USB connection to RSD port 58783 via usbmuxd — auto-detected; confirmed **CONNREFUSED on iOS 18+/26+** (port 58783 not accessible without CoreDevice tunnel)
-- **iOS 18+/26+ USB-NCM auto-connect** - 3-phase fallback: (1) Apple usbmuxd PREFER_NETWORK, (2) Direct NCM IPv6 TCP via host NIC adapter enumeration + NDP. Both require **Apple Devices app** (Microsoft Store) to install the Apple Mobile Device NCM driver. Confirmed not available without it on iOS 26.2 (Mar 2026).
+- **iOS 17+ USB RSD (port 58783)** - Auto-detected; confirmed `CONNREFUSED` on iOS 18+/26+ via plain usbmuxd forwarding (expected).
+- **iOS 17.4+/18+/26+ USB CDTunnel (CoreDeviceProxy)** - Built-in path via `com.apple.internal.devicecompute.CoreDeviceProxy` over USB, then userspace IPv6 tunnel + RSD. Validated on iOS 26.2.
+- **iOS 18+/26+ USB-NCM auto-connect fallback** - 3-phase fallback: (1) Apple usbmuxd PREFER_NETWORK, (2) Direct NCM IPv6 TCP via host NIC adapter enumeration + NDP. Both require **Apple Devices app** (Microsoft Store) to install the Apple Mobile Device NCM driver.
 - **iOS 17+ QUIC Tunnel** - Wi-Fi tunnel via picoquic + picotls + lwIP for wireless devices (no root needed)
 
 ## Dependencies
@@ -246,19 +247,27 @@ auto inst = Instruments::Create("DEVICE-UDID");
 inst->Process().GetProcessList(procs);
 ```
 
-#### iOS 18+/26+ — Requires Apple Devices App or External Tunnel
+#### iOS 18+/26+ — Built-in CDTunnel Primary Path
 
-iOS 18+ (reported as iOS 26+ with Apple's 2025 versioning) moved CoreDevice out of lockdownd. Port 58783 returns `CONNREFUSED` via plain usbmuxd TCP forwarding. Three automatic paths are attempted in order:
+iOS 18+ (reported as iOS 26+ with Apple's 2025 versioning) does not expose RSD port 58783 through plain usbmuxd forwarding. Connection order:
+
+**Phase 0 (primary): USB CDTunnel / CoreDeviceProxy** (`TryUsbQUIC` → `ConnectViaCoreDeviceProxy`)
+Starts `com.apple.internal.devicecompute.CoreDeviceProxy`, performs CDTunnel handshake, brings up userspace IPv6 networking, performs RSD discovery, then creates DTX transport to `com.apple.instruments.dtservicehub`.
+
+Validated on iOS 26.2:
+- RSD handshake complete with service discovery.
+- DTX handshake complete.
+- `runningProcesses` returns full process list.
 
 **Phase 1: Apple usbmuxd PREFER_NETWORK** (`TryNetworkRSD`)
-Works when "Apple Devices" app (Microsoft Store / Windows) has activated the USB-NCM tunnel. Apple's usbmuxd registers iOS 18+ devices with their USB-NCM IPv6 address, making `IDEVICE_LOOKUP_PREFER_NETWORK` return a direct TCP device.
+Works when the Apple Devices app (Microsoft Store / Windows) has activated USB-NCM and usbmuxd exposes a network path.
 
 **Phase 2: Direct USB-NCM IPv6 TCP** (`TryDirectNCMConnection`)
-Enumerates host network adapters for Apple USB-NCM interface, gets device link-local IPv6 from NDP neighbor table, connects directly via TCP. No admin, no libusb — same approach as go-ios. **Requires Apple Devices app** to install the Apple Mobile Device NCM driver.
+Enumerates host adapters for Apple USB-NCM, gets device link-local IPv6 from NDP neighbor table, connects directly via TCP. No admin, no libusb. **Requires Apple Devices app** to install the Apple Mobile Device NCM driver.
 
 > **Windows prerequisite**: Install [Apple Devices](https://apps.microsoft.com/detail/9NP83LWLPZ9K) from the Microsoft Store. This installs the Apple Mobile Device NCM driver that creates the USB-NCM virtual Ethernet adapter. Without it, no USB-NCM adapter exists and both Phase 1 and Phase 2 fail.
 
-**Phase 3 fallback**: If both automatic paths fail, the library logs instructions to use an external CoreDevice tunnel:
+**Phase 3 fallback**: If automatic USB paths fail, the library logs instructions to use an external CoreDevice tunnel:
 
 ```bash
 # go-ios:
@@ -320,6 +329,13 @@ instruments-cli tunnel start --udid <UDID>
 # Debug logging
 instruments-cli process list --udid <UDID> --verbose
 ```
+
+### Troubleshooting and Logs
+
+- Verbose logging is intentionally kept for iOS 17+/18+/26+ tunnel and protocol debugging.
+- Do not remove detailed RSD/CDTunnel/DTX logs unless a specific log site is proven obsolete.
+- `--verbose` output is the primary artifact for diagnosing handshake and transport regressions.
+- When building with Qt, libinstruments and lwIP logging can route to `qDebug` when available.
 
 ## Architecture
 

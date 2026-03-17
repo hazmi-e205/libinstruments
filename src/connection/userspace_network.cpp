@@ -26,6 +26,28 @@ UserspaceTcpConnection::~UserspaceTcpConnection() {
     Close();
 }
 
+void UserspaceTcpConnection::SetConnectedCallback(ConnectedCallback cb) {
+    m_connectedCb = std::move(cb);
+    if (!m_connectedCb) return;
+
+    // Replay known state so late callback registration does not miss connect result.
+    if (m_connected.load()) {
+        m_connectedCb(true);
+    } else if (m_failed.load()) {
+        m_connectedCb(false);
+    }
+}
+
+void UserspaceTcpConnection::SetErrorCallback(ErrorCallback cb) {
+    m_errorCb = std::move(cb);
+    if (!m_errorCb) return;
+
+    // Replay known failure state for late callback registration.
+    if (m_failed.load()) {
+        m_errorCb(Error::ConnectionFailed);
+    }
+}
+
 Error UserspaceTcpConnection::Send(const uint8_t* data, size_t length) {
     if (!m_connected.load() || !m_pcb) {
         return Error::ConnectionFailed;
@@ -60,6 +82,7 @@ err_t UserspaceTcpConnection::OnConnected(void* arg, tcp_pcb* tpcb, err_t err) {
     if (err != ERR_OK) {
         INST_LOG_ERROR(TAG, "TCP connect failed: %d", err);
         conn->m_connected.store(false);
+        conn->m_failed.store(true);
         if (conn->m_connectedCb) conn->m_connectedCb(false);
         if (conn->m_errorCb) conn->m_errorCb(Error::ConnectionFailed);
         return ERR_OK;
@@ -67,6 +90,7 @@ err_t UserspaceTcpConnection::OnConnected(void* arg, tcp_pcb* tpcb, err_t err) {
 
     INST_LOG_INFO(TAG, "TCP connection established");
     conn->m_connected.store(true);
+    conn->m_failed.store(false);
     if (conn->m_connectedCb) conn->m_connectedCb(true);
     return ERR_OK;
 }
@@ -82,6 +106,7 @@ err_t UserspaceTcpConnection::OnRecv(void* arg, tcp_pcb* tpcb, struct pbuf* p, e
         // Connection closed by remote
         INST_LOG_DEBUG(TAG, "TCP connection closed by remote");
         conn->m_connected.store(false);
+        conn->m_failed.store(true);
         if (conn->m_errorCb) conn->m_errorCb(Error::ConnectionFailed);
         return ERR_OK;
     }
@@ -121,6 +146,7 @@ void UserspaceTcpConnection::OnError(void* arg, err_t err) {
     INST_LOG_ERROR(TAG, "TCP error: %d", err);
     conn->m_pcb = nullptr; // pcb is already freed by lwIP on error
     conn->m_connected.store(false);
+    conn->m_failed.store(true);
     if (conn->m_errorCb) conn->m_errorCb(Error::ConnectionFailed);
 }
 
@@ -301,7 +327,12 @@ err_t UserspaceNetwork::NetifInit(struct netif* netif) {
     netif->name[1] = 'n';
     netif->output_ip6 = UserspaceNetwork::NetifOutput;
     netif->mtu = 1280;
+    // CDTunnel/QUIC tunnel carries raw IPv6 packets point-to-point (TUN-like),
+    // not Ethernet frames. Use POINTOPOINT when available in this lwIP build.
     netif->flags = NETIF_FLAG_LINK_UP | NETIF_FLAG_UP;
+#ifdef NETIF_FLAG_POINTTOPOINT
+    netif->flags |= NETIF_FLAG_POINTTOPOINT;
+#endif
     return ERR_OK;
 }
 
@@ -314,6 +345,8 @@ err_t UserspaceNetwork::NetifOutput(struct netif* netif, struct pbuf* p,
     if (!self || !self->m_outputCb) {
         return ERR_IF;
     }
+
+    INST_LOG_INFO(TAG, "NetifOutput: emitting IPv6 packet len=%u", static_cast<unsigned>(p->tot_len));
 
     // Linearize the pbuf chain into a contiguous buffer
     if (p->next == nullptr) {
@@ -337,6 +370,8 @@ namespace instruments {
 
 UserspaceTcpConnection::~UserspaceTcpConnection() {}
 Error UserspaceTcpConnection::Send(const uint8_t*, size_t) { return Error::NotSupported; }
+void UserspaceTcpConnection::SetConnectedCallback(ConnectedCallback) {}
+void UserspaceTcpConnection::SetErrorCallback(ErrorCallback) {}
 void UserspaceTcpConnection::Close() {}
 
 UserspaceNetwork::UserspaceNetwork() = default;

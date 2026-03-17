@@ -11,10 +11,11 @@ namespace instruments {
 // XPC Message flags (from go-ios xpc protocol)
 namespace XPCFlags {
     constexpr uint32_t AlwaysSet = 0x00000001;
-    constexpr uint32_t Data = 0x00000002;
-    constexpr uint32_t InitHandshake = 0x00000400;
-    constexpr uint32_t Ping = 0x00000100;
-    constexpr uint32_t FilePath = 0x00000200;
+    constexpr uint32_t Data = 0x00000100;
+    constexpr uint32_t Ping = 0x00010000;
+    constexpr uint32_t Pong = 0x00020000;
+    constexpr uint32_t FileOpen = 0x00100000;
+    constexpr uint32_t InitHandshake = 0x00400000;
 }
 
 // XPC Message - used for iOS 17+ communication over HTTP/2.

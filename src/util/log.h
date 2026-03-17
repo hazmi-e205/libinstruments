@@ -4,6 +4,17 @@
 #include "../../include/instruments/types.h"
 #include <cstdio>
 #include <cstdarg>
+#include <array>
+
+#if defined(__has_include)
+#if __has_include(<QDebug>)
+#include <QDebug>
+#define INSTRUMENTS_LOG_USE_QDEBUG 1
+#elif __has_include(<QtCore/QDebug>)
+#include <QtCore/QDebug>
+#define INSTRUMENTS_LOG_USE_QDEBUG 1
+#endif
+#endif
 
 namespace instruments {
 
@@ -14,8 +25,6 @@ public:
 
     static void Write(LogLevel level, const char* tag, const char* fmt, ...) {
         if (level > s_level) return;
-        va_list args;
-        va_start(args, fmt);
         const char* prefix = "";
         switch (level) {
             case LogLevel::Error: prefix = "ERROR"; break;
@@ -25,10 +34,20 @@ public:
             case LogLevel::Trace: prefix = "TRACE"; break;
             default: break;
         }
-        fprintf(stderr, "[%s][%s] ", prefix, tag);
-        vfprintf(stderr, fmt, args);
-        fprintf(stderr, "\n");
+
+        std::array<char, 2048> msg{};
+        va_list args;
+        va_start(args, fmt);
+        std::vsnprintf(msg.data(), msg.size(), fmt, args);
         va_end(args);
+
+#if defined(INSTRUMENTS_LOG_USE_QDEBUG)
+        qDebug().noquote().nospace() << "[" << prefix << "][" << tag << "] " << msg.data();
+#else
+        fprintf(stderr, "[%s][%s] ", prefix, tag);
+        fprintf(stderr, "%s", msg.data());
+        fprintf(stderr, "\n");
+#endif
     }
 
 private:

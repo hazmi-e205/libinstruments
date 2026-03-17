@@ -1,5 +1,6 @@
 #include "tunnel_quic.h"
 #include "../util/log.h"
+#include <cctype>
 #include <cstring>
 
 #ifdef INSTRUMENTS_HAS_QUIC
@@ -33,10 +34,58 @@ using socket_t = int;
 #include <plist/plist.h>
 #include <chrono>
 #include <condition_variable>
+#include <future>
 
 namespace instruments {
 
 static const char* TAG = "QUICTunnel";
+
+static bool ConnectIDeviceWithTimeout(idevice_t device, uint16_t port,
+                                      std::chrono::milliseconds timeout,
+                                      idevice_connection_t* outConn,
+                                      idevice_error_t* outErr) {
+    if (!outConn || !outErr) return false;
+
+    std::packaged_task<std::pair<idevice_error_t, idevice_connection_t>()> task(
+        [device, port]() {
+            idevice_connection_t conn = nullptr;
+            idevice_error_t err = idevice_connect(device, port, &conn);
+            return std::make_pair(err, conn);
+        });
+
+    auto fut = task.get_future();
+    std::thread worker(std::move(task));
+
+    if (fut.wait_for(timeout) != std::future_status::ready) {
+        // idevice_connect/usbmuxd_connect can block indefinitely on some setups.
+        // Detach the worker and fail fast so the app can continue fallback logic.
+        worker.detach();
+        *outConn = nullptr;
+        *outErr = IDEVICE_E_TIMEOUT;
+        return false;
+    }
+
+    auto result = fut.get();
+    worker.join();
+    *outErr = result.first;
+    *outConn = result.second;
+    return (result.first == IDEVICE_E_SUCCESS && result.second != nullptr);
+}
+
+static void SetIDeviceRecvTimeoutMs(idevice_connection_t conn, int timeoutMs) {
+    if (!conn || timeoutMs < 0) return;
+    int sockFd = -1;
+    idevice_connection_get_fd(conn, &sockFd);
+    if (sockFd < 0) return;
+#ifdef _WIN32
+    DWORD tmoMs = static_cast<DWORD>(timeoutMs);
+    setsockopt(static_cast<SOCKET>(sockFd), SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&tmoMs), sizeof(tmoMs));
+#else
+    struct timeval tmo = {timeoutMs / 1000, (timeoutMs % 1000) * 1000};
+    setsockopt(sockFd, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof(tmo));
+#endif
+}
 
 // Internal context passed to picoquic callback
 struct QUICCallbackContext {
@@ -440,6 +489,312 @@ Error QUICTunnel::Connect(const std::string& address, uint16_t tunnelPort) {
     return Error::Success;
 }
 
+// ---------- ConnectViaCoreDeviceProxy (CDTunnel - iOS 17.4+, iOS 18+/26+) ----------
+
+Error QUICTunnel::ConnectViaCoreDeviceProxy(idevice_t device) {
+    INST_LOG_INFO(TAG, "ConnectViaCoreDeviceProxy: starting CoreDeviceProxy service");
+
+    // 1. Start lockdown service com.apple.internal.devicecompute.CoreDeviceProxy
+    lockdownd_client_t lockdown = nullptr;
+    if (lockdownd_client_new_with_handshake(device, &lockdown, "libinstruments")
+            != LOCKDOWN_E_SUCCESS) {
+        INST_LOG_ERROR(TAG, "ConnectViaCoreDeviceProxy: lockdown client failed");
+        return Error::ConnectionFailed;
+    }
+
+    lockdownd_service_descriptor_t svcDesc = nullptr;
+    lockdownd_error_t lerr = lockdownd_start_service(
+        lockdown, "com.apple.internal.devicecompute.CoreDeviceProxy", &svcDesc);
+    lockdownd_client_free(lockdown);
+
+    if (lerr != LOCKDOWN_E_SUCCESS || !svcDesc) {
+        INST_LOG_DEBUG(TAG, "ConnectViaCoreDeviceProxy: service not available (err=%d) — "
+                      "device may be iOS <17.4 or not trusted", lerr);
+        return Error::ConnectionFailed;
+    }
+
+    bool needSsl = (svcDesc->ssl_enabled != 0);
+    uint16_t port = svcDesc->port;
+    lockdownd_service_descriptor_free(svcDesc);
+
+    INST_LOG_INFO(TAG, "ConnectViaCoreDeviceProxy: started on port %u (ssl=%d)", port, (int)needSsl);
+
+    // 2. Connect to service port
+    INST_LOG_DEBUG(TAG, "ConnectViaCoreDeviceProxy: connecting to service port %u...", port);
+    idevice_error_t ierr = IDEVICE_E_UNKNOWN_ERROR;
+    if (!ConnectIDeviceWithTimeout(device, port, std::chrono::seconds(8), &m_idevConn, &ierr)) {
+        if (ierr == IDEVICE_E_TIMEOUT) {
+            INST_LOG_ERROR(TAG, "ConnectViaCoreDeviceProxy: idevice_connect timed out on port %u", port);
+        } else {
+            INST_LOG_ERROR(TAG, "ConnectViaCoreDeviceProxy: idevice_connect failed: %d", ierr);
+        }
+        return Error::ConnectionFailed;
+    }
+    if (ierr != IDEVICE_E_SUCCESS || !m_idevConn) {
+        INST_LOG_ERROR(TAG, "ConnectViaCoreDeviceProxy: idevice_connect failed: %d", ierr);
+        return Error::ConnectionFailed;
+    }
+
+    // 3. Enable SSL if the service descriptor requires it
+    if (needSsl) {
+        INST_LOG_INFO(TAG, "ConnectViaCoreDeviceProxy: starting SSL handshake...");
+        ierr = idevice_connection_enable_ssl(m_idevConn);
+        if (ierr != IDEVICE_E_SUCCESS) {
+            INST_LOG_ERROR(TAG, "ConnectViaCoreDeviceProxy: SSL handshake failed: %d", ierr);
+            idevice_disconnect(m_idevConn);
+            m_idevConn = nullptr;
+            return Error::ConnectionFailed;
+        }
+        INST_LOG_INFO(TAG, "ConnectViaCoreDeviceProxy: SSL handshake complete");
+
+        // Set socket-level receive timeout so SSL_read() doesn't block indefinitely.
+        // idevice_connection_receive_timeout() ignores its timeout for SSL connections
+        // because SSL_read() is blocking — SO_RCVTIMEO fixes this at the OS level.
+        SetIDeviceRecvTimeoutMs(m_idevConn, 3000);
+        INST_LOG_DEBUG(TAG, "ConnectViaCoreDeviceProxy: SO_RCVTIMEO=3000ms set for handshake");
+    }
+
+    // 4. CDTunnel handshake
+    Error err = PerformCDTunnelHandshake();
+    if (err != Error::Success) {
+        idevice_disconnect(m_idevConn);
+        m_idevConn = nullptr;
+        return err;
+    }
+
+    // After handshake, keep read timeouts short so ForwardLoop can continue
+    // draining lwIP output (SYN/data) instead of stalling in SSL_read for seconds.
+    SetIDeviceRecvTimeoutMs(m_idevConn, 50);
+    INST_LOG_DEBUG(TAG, "ConnectViaCoreDeviceProxy: SO_RCVTIMEO=50ms set for runtime forwarding");
+
+    // 5. Initialize lwIP network with tunnel parameters
+    err = m_network.Init(m_params.clientAddress, m_params.serverAddress, m_params.mtu);
+    if (err != Error::Success) {
+        INST_LOG_ERROR(TAG, "ConnectViaCoreDeviceProxy: failed to init userspace network");
+        idevice_disconnect(m_idevConn);
+        m_idevConn = nullptr;
+        return err;
+    }
+
+    // 6. Set output callback: lwIP -> CDTunnel output queue (ForwardLoop sends it)
+    m_network.SetOutputCallback([this](const uint8_t* data, size_t len) {
+        std::lock_guard<std::mutex> lock(m_cdOutputMutex);
+        m_cdOutputQueue.emplace_back(data, data + len);
+    });
+
+    m_isCDTunnel = true;
+
+    // 7. Start forwarding thread
+    m_active.store(true);
+    m_forwardThread = std::thread([this]() { ForwardLoop(); });
+
+    INST_LOG_INFO(TAG, "ConnectViaCoreDeviceProxy: CDTunnel active: client=%s server=%s rsd=%u",
+                 m_params.clientAddress.c_str(), m_params.serverAddress.c_str(),
+                 m_params.serverRSDPort);
+
+    return Error::Success;
+}
+
+// ---------- PerformCDTunnelHandshake ----------
+
+Error QUICTunnel::PerformCDTunnelHandshake() {
+    INST_LOG_INFO(TAG, "CDTunnel: starting handshake");
+
+    // Request: "CDTunnel\0" (9 bytes) + 1-byte JSON length + JSON
+    const char* reqJson = "{\"type\":\"clientHandshakeRequest\",\"mtu\":1280}";
+    const size_t jsonLen = std::strlen(reqJson);
+
+    uint8_t reqBuf[256];
+    size_t pos = 0;
+    std::memcpy(reqBuf + pos, "CDTunnel", 8); pos += 8;
+    reqBuf[pos++] = 0x00;  // null terminator of magic
+    reqBuf[pos++] = static_cast<uint8_t>(jsonLen);
+    std::memcpy(reqBuf + pos, reqJson, jsonLen); pos += jsonLen;
+
+    uint32_t sent = 0;
+    idevice_error_t sendErr = idevice_connection_send(
+        m_idevConn, reinterpret_cast<const char*>(reqBuf),
+        static_cast<uint32_t>(pos), &sent);
+    if (sendErr != IDEVICE_E_SUCCESS || sent != static_cast<uint32_t>(pos)) {
+        INST_LOG_ERROR(TAG, "CDTunnel: failed to send handshake request (err=%d sent=%u of %u)",
+                       sendErr, sent, (unsigned)pos);
+        return Error::ConnectionFailed;
+    }
+    INST_LOG_INFO(TAG, "CDTunnel: request sent (%u bytes), waiting for response...", sent);
+
+    // Response: "CDTunnel" (8 bytes) + 1 unknown byte + 1 length byte = 10 bytes header
+    // Then <length> bytes of JSON body
+    uint8_t respHeader[10];
+    size_t totalRecv = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+
+    while (totalRecv < sizeof(respHeader)) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            INST_LOG_ERROR(TAG, "CDTunnel: handshake response header timeout");
+            return Error::Timeout;
+        }
+        uint32_t recvd = 0;
+        idevice_connection_receive_timeout(m_idevConn,
+            reinterpret_cast<char*>(respHeader + totalRecv),
+            static_cast<uint32_t>(sizeof(respHeader) - totalRecv),
+            &recvd, 1000);
+        totalRecv += recvd;
+    }
+
+    // Verify magic
+    if (std::memcmp(respHeader, "CDTunnel", 8) != 0) {
+        INST_LOG_ERROR(TAG, "CDTunnel: invalid response magic");
+        return Error::ProtocolError;
+    }
+
+    // go-ios uses header[9] as body length; iOS 26.x appears to put the length
+    // at header[8] instead (with header[9]=0 being a type/version byte).
+    // Try [9] first; if zero, fall back to [8] as a single-byte length.
+    uint32_t bodyLen = static_cast<uint32_t>(respHeader[9]);
+    if (bodyLen == 0 && respHeader[8] != 0) {
+        bodyLen = static_cast<uint32_t>(respHeader[8]);
+        INST_LOG_DEBUG(TAG, "CDTunnel: byte[9]=0, using byte[8]=%u as bodyLen", bodyLen);
+    }
+    if (bodyLen == 0) {
+        INST_LOG_ERROR(TAG, "CDTunnel: handshake response has zero body length (header[8]=%02x [9]=%02x)",
+                       respHeader[8], respHeader[9]);
+        return Error::ProtocolError;
+    }
+
+    std::vector<uint8_t> jsonBody(bodyLen);
+    totalRecv = 0;
+    while (totalRecv < bodyLen) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            INST_LOG_ERROR(TAG, "CDTunnel: handshake response body timeout");
+            return Error::Timeout;
+        }
+        uint32_t recvd = 0;
+        idevice_connection_receive_timeout(m_idevConn,
+            reinterpret_cast<char*>(jsonBody.data() + totalRecv),
+            static_cast<uint32_t>(bodyLen - totalRecv),
+            &recvd, 1000);
+        totalRecv += recvd;
+    }
+
+    // Log header bytes and JSON for debugging
+    INST_LOG_DEBUG(TAG, "CDTunnel response header[8]=%02x [9]=%02x bodyLen=%u",
+                  respHeader[8], respHeader[9], (unsigned)bodyLen);
+    INST_LOG_INFO(TAG, "CDTunnel response JSON: %.*s",
+                  static_cast<int>(bodyLen), jsonBody.data());
+
+    // Parse JSON response with libplist
+    plist_t root = nullptr;
+    plist_from_json(reinterpret_cast<const char*>(jsonBody.data()),
+                    static_cast<uint32_t>(bodyLen), &root);
+    if (!root) {
+        INST_LOG_ERROR(TAG, "CDTunnel: failed to parse handshake JSON");
+        return Error::ProtocolError;
+    }
+
+    // Log root plist type for debugging
+    plist_type rootType = plist_get_node_type(root);
+    INST_LOG_DEBUG(TAG, "CDTunnel: plist root type=%d (DICT=5)", (int)rootType);
+
+    // Helper: case-insensitive plist dict key lookup — iOS versions vary casing
+    auto dictGetCI = [](plist_t dict, const char* key) -> plist_t {
+        if (!dict || plist_get_node_type(dict) != PLIST_DICT) return nullptr;
+        // Try exact match first
+        plist_t node = plist_dict_get_item(dict, key);
+        if (node) return node;
+        // Fall back to case-insensitive scan
+        plist_dict_iter it = nullptr;
+        plist_dict_new_iter(dict, &it);
+        if (!it) return nullptr;
+        char* iterKey = nullptr;
+        plist_t iterVal = nullptr;
+        plist_t found = nullptr;
+        while (true) {
+            plist_dict_next_item(dict, it, &iterKey, &iterVal);
+            if (!iterKey) break;
+            bool match = true;
+            const char* a = key; const char* b = iterKey;
+            while (*a && *b) {
+                if (std::tolower((unsigned char)*a) != std::tolower((unsigned char)*b)) {
+                    match = false; break;
+                }
+                ++a; ++b;
+            }
+            if (match && *a == '\0' && *b == '\0') {
+                found = iterVal;
+                plist_mem_free(iterKey);
+                break;
+            }
+            plist_mem_free(iterKey);
+        }
+        plist_mem_free(it);
+        return found;
+    };
+
+    // Log all top-level keys at DEBUG level so we can diagnose key name mismatches
+    {
+        plist_dict_iter it = nullptr;
+        plist_dict_new_iter(root, &it);
+        if (it) {
+            char* k = nullptr; plist_t v = nullptr;
+            while (true) {
+                plist_dict_next_item(root, it, &k, &v);
+                if (!k) break;
+                INST_LOG_DEBUG(TAG, "CDTunnel JSON key: '%s'", k);
+                plist_mem_free(k);
+            }
+            plist_mem_free(it);
+        }
+    }
+
+    // Extract ServerAddress (try PascalCase, then camelCase via CI helper)
+    plist_t serverAddrNode = dictGetCI(root, "ServerAddress");
+    if (serverAddrNode) {
+        char* addr = nullptr;
+        plist_get_string_val(serverAddrNode, &addr);
+        if (addr) { m_params.serverAddress = addr; plist_mem_free(addr); }
+    }
+
+    // Extract ServerRSDPort
+    plist_t rsdPortNode = dictGetCI(root, "ServerRSDPort");
+    if (rsdPortNode) {
+        uint64_t p = 0;
+        plist_get_uint_val(rsdPortNode, &p);
+        m_params.serverRSDPort = static_cast<uint16_t>(p);
+    }
+
+    // Extract ClientParameters.Address and Mtu
+    plist_t clientParams = dictGetCI(root, "ClientParameters");
+    if (clientParams) {
+        plist_t addrNode = dictGetCI(clientParams, "Address");
+        if (addrNode) {
+            char* addr = nullptr;
+            plist_get_string_val(addrNode, &addr);
+            if (addr) { m_params.clientAddress = addr; plist_mem_free(addr); }
+        }
+        plist_t mtuNode = dictGetCI(clientParams, "Mtu");
+        if (mtuNode) {
+            uint64_t mtu = 0;
+            plist_get_uint_val(mtuNode, &mtu);
+            if (mtu > 0) m_params.mtu = static_cast<uint32_t>(mtu);
+        }
+    }
+    plist_free(root);
+
+    if (m_params.clientAddress.empty() || m_params.serverAddress.empty()) {
+        INST_LOG_ERROR(TAG, "CDTunnel: handshake response missing addresses");
+        return Error::ProtocolError;
+    }
+    if (m_params.serverRSDPort == 0) m_params.serverRSDPort = 58783;
+
+    INST_LOG_INFO(TAG, "CDTunnel handshake complete: client=%s server=%s rsd=%u mtu=%u",
+                 m_params.clientAddress.c_str(), m_params.serverAddress.c_str(),
+                 m_params.serverRSDPort, m_params.mtu);
+
+    return Error::Success;
+}
+
+// ---------- ConnectViaUSB (QUIC - iOS 17.x lockdown path) ----------
+
 Error QUICTunnel::ConnectViaUSB(idevice_t device) {
     INST_LOG_INFO(TAG, "ConnectViaUSB: starting CoreDevice tunnel service");
 
@@ -482,7 +837,16 @@ Error QUICTunnel::ConnectViaUSB(idevice_t device) {
     INST_LOG_INFO(TAG, "ConnectViaUSB: started %s on port %u", selectedService, svcDesc->port);
 
     // 2. Connect to service port
-    idevice_error_t ierr = idevice_connect(device, svcDesc->port, &m_idevConn);
+    idevice_error_t ierr = IDEVICE_E_UNKNOWN_ERROR;
+    if (!ConnectIDeviceWithTimeout(device, svcDesc->port, std::chrono::seconds(8), &m_idevConn, &ierr)) {
+        if (ierr == IDEVICE_E_TIMEOUT) {
+            INST_LOG_ERROR(TAG, "ConnectViaUSB: idevice_connect timed out on port %u", svcDesc->port);
+        } else {
+            INST_LOG_ERROR(TAG, "ConnectViaUSB: idevice_connect failed: %d", ierr);
+        }
+        lockdownd_service_descriptor_free(svcDesc);
+        return Error::ConnectionFailed;
+    }
     lockdownd_service_descriptor_free(svcDesc);
 
     if (ierr != IDEVICE_E_SUCCESS || !m_idevConn) {
@@ -905,8 +1269,13 @@ int QUICTunnel::CreateTunnelSocket(const std::string& destIPv6, uint16_t port) {
         [&waiter]() { return waiter->connected || waiter->failed; });
 
     if (!ok || !waiter->connected || waiter->failed) {
-        INST_LOG_ERROR(TAG, "CreateTunnelSocket: connection to [%s]:%u failed",
-                      destIPv6.c_str(), port);
+        if (!ok) {
+            INST_LOG_ERROR(TAG, "CreateTunnelSocket: connection to [%s]:%u timed out waiting for lwIP connect",
+                          destIPv6.c_str(), port);
+        } else {
+            INST_LOG_ERROR(TAG, "CreateTunnelSocket: connection to [%s]:%u failed (lwIP error callback)",
+                          destIPv6.c_str(), port);
+        }
 #ifdef _WIN32
         closesocket(static_cast<SOCKET>(fds[0]));
         closesocket(static_cast<SOCKET>(fds[1]));
@@ -1125,7 +1494,7 @@ void QUICTunnel::ForwardLoop() {
     // For UDP mode: get the peer address for incoming packet attribution
     struct sockaddr_storage destAddr = {};
     socklen_t destAddrLen = sizeof(destAddr);
-    if (!m_isUsb) {
+    if (!m_isUsb && !m_isCDTunnel) {
         getpeername(static_cast<socket_t>(m_udpSocket),
                     reinterpret_cast<struct sockaddr*>(&destAddr), &destAddrLen);
     }
@@ -1134,96 +1503,146 @@ void QUICTunnel::ForwardLoop() {
         // Process pending tasks from other threads (lwIP thread safety)
         DrainTasks();
 
-        uint64_t currentTime = picoquic_current_time();
+        if (m_isCDTunnel) {
+            // --- CDTunnel path: raw IPv6 packets over SSL TCP ---
 
-        // Prepare and send outgoing QUIC packets
-        bool hasSomethingToSend = true;
-        while (hasSomethingToSend) {
-            struct sockaddr_storage addrTo = {}, addrFrom = {};
-            int ifIndex = 0;
-            size_t sendLength = 0;
-            picoquic_connection_id_t logCid = {};
-            picoquic_cnx_t* lastCnx = nullptr;
-
-            int ret = picoquic_prepare_next_packet(m_quic, currentTime,
-                sendBuffer, sizeof(sendBuffer), &sendLength,
-                &addrTo, &addrFrom, &ifIndex, &logCid, &lastCnx);
-
-            if (ret != 0 || sendLength == 0) {
-                hasSomethingToSend = false;
-                break;
+            // Receive: read available bytes into recv buffer (non-blocking)
+            uint8_t tmp[4096];
+            uint32_t recvd = 0;
+            idevice_error_t rerr = idevice_connection_receive_timeout(m_idevConn,
+                reinterpret_cast<char*>(tmp), sizeof(tmp), &recvd, 20);
+            if (recvd > 0) {
+                m_cdRecvBuf.insert(m_cdRecvBuf.end(), tmp, tmp + recvd);
+            } else if (rerr != IDEVICE_E_TIMEOUT && rerr != IDEVICE_E_SUCCESS) {
+                INST_LOG_DEBUG(TAG, "CDTunnel: receive returned err=%d", static_cast<int>(rerr));
             }
 
-            if (m_isUsb) {
-                SendFramed(sendBuffer, sendLength);
-            } else {
-                sendto(static_cast<socket_t>(m_udpSocket),
-                       reinterpret_cast<const char*>(sendBuffer),
-                       static_cast<int>(sendLength), 0,
-                       reinterpret_cast<struct sockaddr*>(&addrTo),
-                       static_cast<int>(destAddrLen));
-            }
-        }
+            // Extract and inject complete IPv6 packets into lwIP
+            while (m_cdRecvBuf.size() >= 40) {
+                if ((m_cdRecvBuf[0] & 0xF0) != 0x60) {
+                    // Not an IPv6 packet — stream is corrupt
+                    INST_LOG_ERROR(TAG, "CDTunnel: invalid IPv6 packet (byte0=0x%02x), closing",
+                                  m_cdRecvBuf[0]);
+                    m_active.store(false);
+                    break;
+                }
+                uint16_t payloadLen = (static_cast<uint16_t>(m_cdRecvBuf[4]) << 8)
+                                    | static_cast<uint16_t>(m_cdRecvBuf[5]);
+                size_t totalLen = 40u + payloadLen;
+                if (m_cdRecvBuf.size() < totalLen) break;  // incomplete packet
 
-        // Receive incoming packets
-        if (m_isUsb) {
-            int pktLen = RecvFramedPartial(recvBuffer, sizeof(recvBuffer));
-            while (pktLen > 0) {
-                currentTime = picoquic_current_time();
-                picoquic_incoming_packet(m_quic, recvBuffer, (size_t)pktLen,
-                    reinterpret_cast<struct sockaddr*>(&m_fakeRemoteAddr),
-                    reinterpret_cast<struct sockaddr*>(&m_fakeLocalAddr),
-                    0, 0, currentTime);
-                pktLen = RecvFramedPartial(recvBuffer, sizeof(recvBuffer));
+                m_network.InjectPacket(m_cdRecvBuf.data(), totalLen);
+                m_cdRecvBuf.erase(m_cdRecvBuf.begin(),
+                                  m_cdRecvBuf.begin() + static_cast<ptrdiff_t>(totalLen));
             }
+
+            // Send: drain output queue (lwIP -> device)
+            std::vector<std::vector<uint8_t>> toSend;
+            {
+                std::lock_guard<std::mutex> lock(m_cdOutputMutex);
+                toSend.swap(m_cdOutputQueue);
+            }
+            for (auto& pkt : toSend) {
+                uint32_t sentBytes = 0;
+                idevice_connection_send(m_idevConn,
+                    reinterpret_cast<const char*>(pkt.data()),
+                    static_cast<uint32_t>(pkt.size()), &sentBytes);
+            }
+
         } else {
-            // Receive incoming UDP packets (non-blocking)
-            struct sockaddr_storage recvFrom = {};
-            socklen_t fromLen = sizeof(recvFrom);
+            // --- QUIC path (USB framed stream or UDP) ---
+
+            uint64_t currentTime = picoquic_current_time();
+
+            // Prepare and send outgoing QUIC packets
+            bool hasSomethingToSend = true;
+            while (hasSomethingToSend) {
+                struct sockaddr_storage addrTo = {}, addrFrom = {};
+                int ifIndex = 0;
+                size_t sendLength = 0;
+                picoquic_connection_id_t logCid = {};
+                picoquic_cnx_t* lastCnx = nullptr;
+
+                int ret = picoquic_prepare_next_packet(m_quic, currentTime,
+                    sendBuffer, sizeof(sendBuffer), &sendLength,
+                    &addrTo, &addrFrom, &ifIndex, &logCid, &lastCnx);
+
+                if (ret != 0 || sendLength == 0) {
+                    hasSomethingToSend = false;
+                    break;
+                }
+
+                if (m_isUsb) {
+                    SendFramed(sendBuffer, sendLength);
+                } else {
+                    sendto(static_cast<socket_t>(m_udpSocket),
+                           reinterpret_cast<const char*>(sendBuffer),
+                           static_cast<int>(sendLength), 0,
+                           reinterpret_cast<struct sockaddr*>(&addrTo),
+                           static_cast<int>(destAddrLen));
+                }
+            }
+
+            // Receive incoming packets
+            if (m_isUsb) {
+                int pktLen = RecvFramedPartial(recvBuffer, sizeof(recvBuffer));
+                while (pktLen > 0) {
+                    currentTime = picoquic_current_time();
+                    picoquic_incoming_packet(m_quic, recvBuffer, (size_t)pktLen,
+                        reinterpret_cast<struct sockaddr*>(&m_fakeRemoteAddr),
+                        reinterpret_cast<struct sockaddr*>(&m_fakeLocalAddr),
+                        0, 0, currentTime);
+                    pktLen = RecvFramedPartial(recvBuffer, sizeof(recvBuffer));
+                }
+            } else {
+                // Receive incoming UDP packets (non-blocking)
+                struct sockaddr_storage recvFrom = {};
+                socklen_t fromLen = sizeof(recvFrom);
 
 #ifdef _WIN32
-            int recvLen = recvfrom(static_cast<socket_t>(m_udpSocket),
-                reinterpret_cast<char*>(recvBuffer), sizeof(recvBuffer), 0,
-                reinterpret_cast<struct sockaddr*>(&recvFrom), &fromLen);
-            while (recvLen > 0) {
-#else
-            ssize_t recvLen = recvfrom(m_udpSocket,
-                recvBuffer, sizeof(recvBuffer), 0,
-                reinterpret_cast<struct sockaddr*>(&recvFrom), &fromLen);
-            while (recvLen > 0) {
-#endif
-                currentTime = picoquic_current_time();
-                picoquic_incoming_packet(m_quic, recvBuffer, static_cast<size_t>(recvLen),
-                    reinterpret_cast<struct sockaddr*>(&recvFrom),
-                    reinterpret_cast<struct sockaddr*>(&destAddr),
-                    0, 0, currentTime);
-
-                fromLen = sizeof(recvFrom);
-#ifdef _WIN32
-                recvLen = recvfrom(static_cast<socket_t>(m_udpSocket),
+                int recvLen = recvfrom(static_cast<socket_t>(m_udpSocket),
                     reinterpret_cast<char*>(recvBuffer), sizeof(recvBuffer), 0,
                     reinterpret_cast<struct sockaddr*>(&recvFrom), &fromLen);
+                while (recvLen > 0) {
 #else
-                recvLen = recvfrom(m_udpSocket,
+                ssize_t recvLen = recvfrom(m_udpSocket,
                     recvBuffer, sizeof(recvBuffer), 0,
                     reinterpret_cast<struct sockaddr*>(&recvFrom), &fromLen);
+                while (recvLen > 0) {
 #endif
-            }
-        }
+                    currentTime = picoquic_current_time();
+                    picoquic_incoming_packet(m_quic, recvBuffer, static_cast<size_t>(recvLen),
+                        reinterpret_cast<struct sockaddr*>(&recvFrom),
+                        reinterpret_cast<struct sockaddr*>(&destAddr),
+                        0, 0, currentTime);
 
-        // Bridge OS sockets <-> lwIP TCP connections
+                    fromLen = sizeof(recvFrom);
+#ifdef _WIN32
+                    recvLen = recvfrom(static_cast<socket_t>(m_udpSocket),
+                        reinterpret_cast<char*>(recvBuffer), sizeof(recvBuffer), 0,
+                        reinterpret_cast<struct sockaddr*>(&recvFrom), &fromLen);
+#else
+                    recvLen = recvfrom(m_udpSocket,
+                        recvBuffer, sizeof(recvBuffer), 0,
+                        reinterpret_cast<struct sockaddr*>(&recvFrom), &fromLen);
+#endif
+                }
+            }
+
+            // Check connection state
+            picoquic_state_enum state = picoquic_get_cnx_state(m_cnx);
+            if (state == picoquic_state_disconnected) {
+                INST_LOG_WARN(TAG, "QUIC connection disconnected");
+                m_active.store(false);
+                break;
+            }
+        } // end QUIC path
+
+        // Bridge OS sockets <-> lwIP TCP connections (both paths)
         DrainBridges();
 
-        // Poll lwIP timers
+        // Poll lwIP timers (both paths)
         m_network.Poll();
-
-        // Check connection state
-        picoquic_state_enum state = picoquic_get_cnx_state(m_cnx);
-        if (state == picoquic_state_disconnected) {
-            INST_LOG_WARN(TAG, "QUIC connection disconnected");
-            m_active.store(false);
-            break;
-        }
 
         // Brief sleep to avoid burning CPU
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -1303,13 +1722,14 @@ void QUICTunnel::Close() {
         m_udpSocket = -1;
     }
 
-    // Close USB stream connection (iOS 17.x lockdown path)
-    if (m_isUsb && m_idevConn) {
+    // Close USB stream connection (QUIC USB or CDTunnel path)
+    if ((m_isUsb || m_isCDTunnel) && m_idevConn) {
         idevice_disconnect(m_idevConn);
         m_idevConn = nullptr;
     }
 
     m_isUsb = false;
+    m_isCDTunnel = false;
 }
 
 } // namespace instruments
@@ -1338,6 +1758,12 @@ Error QUICTunnel::Connect(const std::string& address, uint16_t tunnelPort) {
     return Error::NotSupported;
 }
 
+Error QUICTunnel::ConnectViaCoreDeviceProxy(idevice_t device) {
+    (void)device;
+    INST_LOG_WARN(TAG, "ConnectViaCoreDeviceProxy requires INSTRUMENTS_HAS_QUIC build flag (lwIP needed).");
+    return Error::NotSupported;
+}
+
 Error QUICTunnel::ConnectViaUSB(idevice_t device) {
     (void)device;
     INST_LOG_WARN(TAG, "ConnectViaUSB requires INSTRUMENTS_HAS_QUIC build flag.");
@@ -1354,14 +1780,19 @@ int QUICTunnel::CreateTunnelSocket(const std::string& destIPv6, uint16_t port) {
 void QUICTunnel::Close() {
     if (!m_active.exchange(false)) return;
 
-    INST_LOG_INFO(TAG, "Closing QUIC tunnel");
+    INST_LOG_INFO(TAG, "Closing tunnel");
 
     if (m_forwardThread.joinable()) {
         m_forwardThread.join();
     }
 
+    if ((m_isUsb || m_isCDTunnel) && m_idevConn) {
+        idevice_disconnect(m_idevConn);
+        m_idevConn = nullptr;
+    }
+
     m_isUsb = false;
-    m_idevConn = nullptr;
+    m_isCDTunnel = false;
 }
 
 void QUICTunnel::SubmitToLoop(std::function<void()> fn) {

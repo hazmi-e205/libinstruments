@@ -1,224 +1,408 @@
 #include "xpc_message.h"
 #include "../util/log.h"
-#include <plist/plist.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <string>
+#include <vector>
 
 namespace instruments {
 
 static const char* TAG = "XPCMessage";
 
-// Convert NSObject to plist_t (recursive)
-static plist_t NSObjectToPlist(const NSObject& obj) {
+namespace {
+constexpr uint32_t kWrapperMagic = 0x29b00b92;
+constexpr uint32_t kObjectMagic = 0x42133742;
+constexpr uint32_t kBodyVersion = 0x00000005;
+
+enum class XpcType : uint32_t {
+    Null       = 0x00001000,
+    Bool       = 0x00002000,
+    Int64      = 0x00003000,
+    UInt64     = 0x00004000,
+    Double     = 0x00005000,
+    Date       = 0x00007000,
+    Data       = 0x00008000,
+    String     = 0x00009000,
+    Uuid       = 0x0000a000,
+    Array      = 0x0000e000,
+    Dictionary = 0x0000f000,
+    FileTransfer = 0x0001a000,
+};
+
+static size_t Pad4(size_t n) {
+    return (4 - (n % 4)) % 4;
+}
+
+static void WriteU32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>(v & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+    out.push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+}
+
+static void WriteU64(std::vector<uint8_t>& out, uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+        out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+    }
+}
+
+static bool ReadU32(const uint8_t*& p, const uint8_t* end, uint32_t& v) {
+    if (static_cast<size_t>(end - p) < 4) return false;
+    v = static_cast<uint32_t>(p[0])
+      | (static_cast<uint32_t>(p[1]) << 8)
+      | (static_cast<uint32_t>(p[2]) << 16)
+      | (static_cast<uint32_t>(p[3]) << 24);
+    p += 4;
+    return true;
+}
+
+static bool ReadU64(const uint8_t*& p, const uint8_t* end, uint64_t& v) {
+    if (static_cast<size_t>(end - p) < 8) return false;
+    v = 0;
+    for (int i = 0; i < 8; i++) {
+        v |= (static_cast<uint64_t>(p[i]) << (8 * i));
+    }
+    p += 8;
+    return true;
+}
+
+static bool EncodeObject(const NSObject& obj, std::vector<uint8_t>& out);
+
+static bool EncodeStringPayload(const std::string& s, std::vector<uint8_t>& out) {
+    WriteU32(out, static_cast<uint32_t>(XpcType::String));
+    const uint32_t len = static_cast<uint32_t>(s.size() + 1);
+    WriteU32(out, len);
+    out.insert(out.end(), s.begin(), s.end());
+    out.push_back(0);
+    out.insert(out.end(), Pad4(len), 0);
+    return true;
+}
+
+static bool EncodeDataPayload(const std::vector<uint8_t>& d, std::vector<uint8_t>& out) {
+    WriteU32(out, static_cast<uint32_t>(XpcType::Data));
+    WriteU32(out, static_cast<uint32_t>(d.size()));
+    out.insert(out.end(), d.begin(), d.end());
+    out.insert(out.end(), Pad4(d.size()), 0);
+    return true;
+}
+
+static bool EncodeArrayPayload(const NSObject::ArrayType& arr, std::vector<uint8_t>& out) {
+    std::vector<uint8_t> payload;
+    for (const auto& item : arr) {
+        if (!EncodeObject(item, payload)) return false;
+    }
+    WriteU32(out, static_cast<uint32_t>(XpcType::Array));
+    WriteU32(out, static_cast<uint32_t>(payload.size()));
+    WriteU32(out, static_cast<uint32_t>(arr.size()));
+    out.insert(out.end(), payload.begin(), payload.end());
+    return true;
+}
+
+static bool EncodeDictPayload(const NSObject::DictType& dict, std::vector<uint8_t>& out) {
+    std::vector<uint8_t> payload;
+    WriteU32(payload, static_cast<uint32_t>(dict.size()));
+    for (const auto& kv : dict) {
+        const std::string& key = kv.first;
+        payload.insert(payload.end(), key.begin(), key.end());
+        payload.push_back(0);
+        payload.insert(payload.end(), Pad4(key.size() + 1), 0);
+        if (!EncodeObject(kv.second, payload)) return false;
+    }
+    WriteU32(out, static_cast<uint32_t>(XpcType::Dictionary));
+    WriteU32(out, static_cast<uint32_t>(payload.size()));
+    out.insert(out.end(), payload.begin(), payload.end());
+    return true;
+}
+
+static bool EncodeObject(const NSObject& obj, std::vector<uint8_t>& out) {
     switch (obj.GetType()) {
         case NSObject::Type::Null:
-            return plist_new_string("$null");
+            WriteU32(out, static_cast<uint32_t>(XpcType::Null));
+            return true;
         case NSObject::Type::Bool:
-            return plist_new_bool(obj.AsBool());
+            WriteU32(out, static_cast<uint32_t>(XpcType::Bool));
+            out.push_back(obj.AsBool() ? 1 : 0);
+            out.push_back(0); out.push_back(0); out.push_back(0);
+            return true;
         case NSObject::Type::Int32:
         case NSObject::Type::Int64:
-            return plist_new_int(obj.AsInt64());
+            WriteU32(out, static_cast<uint32_t>(XpcType::Int64));
+            WriteU64(out, static_cast<uint64_t>(obj.AsInt64()));
+            return true;
         case NSObject::Type::UInt64:
-            return plist_new_uint(obj.AsUInt64());
+            WriteU32(out, static_cast<uint32_t>(XpcType::UInt64));
+            WriteU64(out, obj.AsUInt64());
+            return true;
         case NSObject::Type::Float32:
-        case NSObject::Type::Float64:
-            return plist_new_real(obj.AsDouble());
+        case NSObject::Type::Float64: {
+            WriteU32(out, static_cast<uint32_t>(XpcType::Double));
+            uint64_t bits = 0;
+            double d = obj.AsDouble();
+            std::memcpy(&bits, &d, sizeof(bits));
+            WriteU64(out, bits);
+            return true;
+        }
         case NSObject::Type::String:
-            return plist_new_string(obj.AsString().c_str());
+            return EncodeStringPayload(obj.AsString(), out);
         case NSObject::Type::Data:
-            return plist_new_data(
-                reinterpret_cast<const char*>(obj.AsData().data()),
-                obj.AsData().size());
+            return EncodeDataPayload(obj.AsData(), out);
         case NSObject::Type::Array:
-        case NSObject::Type::Set: {
-            plist_t arr = plist_new_array();
-            for (const auto& item : obj.AsArray()) {
-                plist_array_append_item(arr, NSObjectToPlist(item));
-            }
-            return arr;
-        }
-        case NSObject::Type::Dictionary: {
-            plist_t dict = plist_new_dict();
-            for (const auto& [key, val] : obj.AsDict()) {
-                plist_dict_set_item(dict, key.c_str(), NSObjectToPlist(val));
-            }
-            return dict;
-        }
+        case NSObject::Type::Set:
+            return EncodeArrayPayload(obj.AsArray(), out);
+        case NSObject::Type::Dictionary:
+            return EncodeDictPayload(obj.AsDict(), out);
     }
-    return plist_new_string("$null");
+    return false;
 }
 
-// Convert plist_t to NSObject (recursive)
-static NSObject PlistToNSObject(plist_t node) {
-    if (!node) return NSObject::Null();
+static bool DecodeObject(const uint8_t*& p, const uint8_t* end, NSObject& out);
 
-    plist_type type = plist_get_node_type(node);
+static bool DecodeString(const uint8_t*& p, const uint8_t* end, NSObject& out) {
+    uint32_t len = 0;
+    if (!ReadU32(p, end, len)) return false;
+    if (static_cast<size_t>(end - p) < len) return false;
+    std::string s(reinterpret_cast<const char*>(p), reinterpret_cast<const char*>(p + len));
+    while (!s.empty() && s.back() == '\0') s.pop_back();
+    p += len;
+    size_t pad = Pad4(len);
+    if (static_cast<size_t>(end - p) < pad) return false;
+    p += pad;
+    out = NSObject(std::move(s));
+    return true;
+}
+
+static bool DecodeData(const uint8_t*& p, const uint8_t* end, NSObject& out) {
+    uint32_t len = 0;
+    if (!ReadU32(p, end, len)) return false;
+    if (static_cast<size_t>(end - p) < len) return false;
+    std::vector<uint8_t> data(p, p + len);
+    p += len;
+    size_t pad = Pad4(len);
+    if (static_cast<size_t>(end - p) < pad) return false;
+    p += pad;
+    out = NSObject(std::move(data));
+    return true;
+}
+
+static bool DecodeArray(const uint8_t*& p, const uint8_t* end, NSObject& out) {
+    uint32_t payloadLen = 0;
+    uint32_t numEntries = 0;
+    if (!ReadU32(p, end, payloadLen)) return false;
+    if (!ReadU32(p, end, numEntries)) return false;
+    if (static_cast<size_t>(end - p) < payloadLen) return false;
+    const uint8_t* payloadEnd = p + payloadLen;
+
+    NSObject::ArrayType arr;
+    arr.reserve(numEntries);
+    for (uint32_t i = 0; i < numEntries; i++) {
+        NSObject item = NSObject::Null();
+        if (!DecodeObject(p, payloadEnd, item)) return false;
+        arr.push_back(std::move(item));
+    }
+    p = payloadEnd;
+    out = NSObject(std::move(arr));
+    return true;
+}
+
+static bool DecodeDictionary(const uint8_t*& p, const uint8_t* end, NSObject& out) {
+    uint32_t payloadLen = 0;
+    uint32_t numEntries = 0;
+    if (!ReadU32(p, end, payloadLen)) return false;
+    if (static_cast<size_t>(end - p) < payloadLen) return false;
+    const uint8_t* payloadEnd = p + payloadLen;
+    if (!ReadU32(p, payloadEnd, numEntries)) return false;
+
+    NSObject::DictType dict;
+    for (uint32_t i = 0; i < numEntries; i++) {
+        const uint8_t* keyStart = p;
+        while (p < payloadEnd && *p != 0) p++;
+        if (p >= payloadEnd) return false;
+        std::string key(reinterpret_cast<const char*>(keyStart), reinterpret_cast<const char*>(p));
+        p++; // skip null
+        size_t keyRawLen = key.size() + 1;
+        size_t pad = Pad4(keyRawLen);
+        if (static_cast<size_t>(payloadEnd - p) < pad) return false;
+        p += pad;
+
+        NSObject val = NSObject::Null();
+        if (!DecodeObject(p, payloadEnd, val)) return false;
+        dict[key] = std::move(val);
+    }
+    p = payloadEnd;
+    out = NSObject(std::move(dict));
+    return true;
+}
+
+static std::string FormatUuid(const uint8_t* b16) {
+    char s[37] = {0};
+    std::snprintf(
+        s, sizeof(s),
+        "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+        b16[0], b16[1], b16[2], b16[3], b16[4], b16[5], b16[6], b16[7],
+        b16[8], b16[9], b16[10], b16[11], b16[12], b16[13], b16[14], b16[15]);
+    return std::string(s);
+}
+
+static bool DecodeObject(const uint8_t*& p, const uint8_t* end, NSObject& out) {
+    uint32_t typeU32 = 0;
+    if (!ReadU32(p, end, typeU32)) return false;
+    XpcType type = static_cast<XpcType>(typeU32);
+
     switch (type) {
-        case PLIST_BOOLEAN: {
-            uint8_t val = 0;
-            plist_get_bool_val(node, &val);
-            return NSObject(static_cast<bool>(val));
+        case XpcType::Null:
+            out = NSObject::Null();
+            return true;
+        case XpcType::Bool: {
+            if (static_cast<size_t>(end - p) < 4) return false;
+            bool b = (p[0] != 0);
+            p += 4;
+            out = NSObject(b);
+            return true;
         }
-        case PLIST_INT: {
-            int64_t val = 0;
-            plist_get_int_val(node, &val);
-            return NSObject(val);
+        case XpcType::Int64: {
+            uint64_t u = 0;
+            if (!ReadU64(p, end, u)) return false;
+            out = NSObject(static_cast<int64_t>(u));
+            return true;
         }
-        case PLIST_REAL: {
-            double val = 0.0;
-            plist_get_real_val(node, &val);
-            return NSObject(val);
+        case XpcType::UInt64: {
+            uint64_t u = 0;
+            if (!ReadU64(p, end, u)) return false;
+            out = NSObject(u);
+            return true;
         }
-        case PLIST_STRING: {
-            char* val = nullptr;
-            plist_get_string_val(node, &val);
-            if (val) {
-                NSObject obj{std::string(val)};
-                plist_mem_free(val);
-                return obj;
-            }
-            return NSObject(std::string(""));
+        case XpcType::Double: {
+            uint64_t bits = 0;
+            if (!ReadU64(p, end, bits)) return false;
+            double d = 0.0;
+            std::memcpy(&d, &bits, sizeof(d));
+            out = NSObject(d);
+            return true;
         }
-        case PLIST_DATA: {
-            char* val = nullptr;
-            uint64_t len = 0;
-            plist_get_data_val(node, &val, &len);
-            if (val && len > 0) {
-                std::vector<uint8_t> data(
-                    reinterpret_cast<uint8_t*>(val),
-                    reinterpret_cast<uint8_t*>(val) + len);
-                plist_mem_free(val);
-                return NSObject(std::move(data));
-            }
-            if (val) plist_mem_free(val);
-            return NSObject(std::vector<uint8_t>{});
+        case XpcType::Date: {
+            uint64_t u = 0;
+            if (!ReadU64(p, end, u)) return false;
+            out = NSObject(static_cast<int64_t>(u));
+            return true;
         }
-        case PLIST_ARRAY: {
-            NSObject::ArrayType arr;
-            uint32_t count = plist_array_get_size(node);
-            for (uint32_t i = 0; i < count; i++) {
-                arr.push_back(PlistToNSObject(plist_array_get_item(node, i)));
-            }
-            return NSObject(std::move(arr));
+        case XpcType::String:
+            return DecodeString(p, end, out);
+        case XpcType::Data:
+            return DecodeData(p, end, out);
+        case XpcType::Uuid: {
+            if (static_cast<size_t>(end - p) < 16) return false;
+            const std::string uuidText = FormatUuid(p);
+            p += 16;
+            out = NSObject(uuidText);
+            return true;
         }
-        case PLIST_DICT: {
-            NSObject::DictType dict;
-            plist_dict_iter iter = nullptr;
-            plist_dict_new_iter(node, &iter);
-            if (iter) {
-                char* key = nullptr;
-                plist_t val = nullptr;
-                while (true) {
-                    plist_dict_next_item(node, iter, &key, &val);
-                    if (!key) break;
-                    dict[key] = PlistToNSObject(val);
-                    plist_mem_free(key);
-                    key = nullptr;
-                }
-                free(iter);
-            }
-            return NSObject(std::move(dict));
+        case XpcType::Array:
+            return DecodeArray(p, end, out);
+        case XpcType::Dictionary:
+            return DecodeDictionary(p, end, out);
+        case XpcType::FileTransfer: {
+            uint64_t msgId = 0;
+            if (!ReadU64(p, end, msgId)) return false;
+            NSObject nested = NSObject::Null();
+            if (!DecodeObject(p, end, nested)) return false;
+            NSObject::DictType ft;
+            ft["MsgId"] = NSObject(msgId);
+            ft["Value"] = std::move(nested);
+            out = NSObject(std::move(ft));
+            return true;
         }
         default:
-            return NSObject::Null();
+            INST_LOG_DEBUG(TAG, "Unsupported XPC object type: 0x%08x", typeU32);
+            return false;
     }
 }
-
-// XPC wire format:
-// - 4 bytes: flags (LE)
-// - 8 bytes: message ID (LE)
-// - 8 bytes: body length (LE)
-// - N bytes: body (binary plist)
+} // namespace
 
 std::vector<uint8_t> XPCMessage::Encode() const {
-    std::vector<uint8_t> result;
+    std::vector<uint8_t> out;
+    out.reserve(64);
 
-    // Encode body to binary plist
-    std::vector<uint8_t> bodyData;
+    WriteU32(out, kWrapperMagic);
+    WriteU32(out, flags);
+
+    std::vector<uint8_t> bodyPayload;
     if (!body.IsNull()) {
-        plist_t plistBody = NSObjectToPlist(body);
-
-        char* binData = nullptr;
-        uint32_t binLen = 0;
-        plist_to_bin(plistBody, &binData, &binLen);
-        plist_free(plistBody);
-
-        if (binData && binLen > 0) {
-            bodyData.assign(reinterpret_cast<uint8_t*>(binData),
-                          reinterpret_cast<uint8_t*>(binData) + binLen);
-            plist_mem_free(binData);
+        if (!EncodeObject(body, bodyPayload)) {
+            INST_LOG_WARN(TAG, "Failed to encode XPC body object");
+            bodyPayload.clear();
         }
     }
 
-    // Write header
-    result.resize(20 + bodyData.size());
+    uint64_t bodyLen = bodyPayload.empty() ? 0 : static_cast<uint64_t>(8 + bodyPayload.size());
+    WriteU64(out, bodyLen);
+    WriteU64(out, messageId);
 
-    // Flags (4 bytes LE)
-    result[0] = flags & 0xFF;
-    result[1] = (flags >> 8) & 0xFF;
-    result[2] = (flags >> 16) & 0xFF;
-    result[3] = (flags >> 24) & 0xFF;
-
-    // Message ID (8 bytes LE)
-    for (int i = 0; i < 8; i++) {
-        result[4 + i] = (messageId >> (i * 8)) & 0xFF;
+    if (!bodyPayload.empty()) {
+        WriteU32(out, kObjectMagic);
+        WriteU32(out, kBodyVersion);
+        out.insert(out.end(), bodyPayload.begin(), bodyPayload.end());
     }
 
-    // Body length (8 bytes LE)
-    uint64_t bodyLen = bodyData.size();
-    for (int i = 0; i < 8; i++) {
-        result[12 + i] = (bodyLen >> (i * 8)) & 0xFF;
-    }
-
-    // Body
-    if (!bodyData.empty()) {
-        std::memcpy(result.data() + 20, bodyData.data(), bodyData.size());
-    }
-
-    return result;
+    return out;
 }
 
 bool XPCMessage::Decode(const uint8_t* data, size_t length, XPCMessage& outMsg) {
-    if (length < 20) {
+    if (!data || length < 24) {
         INST_LOG_WARN(TAG, "XPC message too small: %zu bytes", length);
         return false;
     }
 
-    // Flags
-    outMsg.flags = static_cast<uint32_t>(data[0])
-                 | (static_cast<uint32_t>(data[1]) << 8)
-                 | (static_cast<uint32_t>(data[2]) << 16)
-                 | (static_cast<uint32_t>(data[3]) << 24);
+    const uint8_t* p = data;
+    const uint8_t* end = data + length;
 
-    // Message ID
-    outMsg.messageId = 0;
-    for (int i = 0; i < 8; i++) {
-        outMsg.messageId |= (static_cast<uint64_t>(data[4 + i]) << (i * 8));
-    }
-
-    // Body length
-    uint64_t bodyLen = 0;
-    for (int i = 0; i < 8; i++) {
-        bodyLen |= (static_cast<uint64_t>(data[12 + i]) << (i * 8));
-    }
-
-    if (20 + bodyLen > length) {
-        INST_LOG_WARN(TAG, "XPC body extends beyond message: %llu + 20 > %zu",
-                     (unsigned long long)bodyLen, length);
+    uint32_t magic = 0;
+    if (!ReadU32(p, end, magic) || magic != kWrapperMagic) {
+        INST_LOG_DEBUG(TAG, "XPC wrapper magic mismatch: 0x%08x", magic);
         return false;
     }
 
-    // Parse body
-    if (bodyLen > 0) {
-        plist_t plistBody = nullptr;
-        plist_from_bin(reinterpret_cast<const char*>(data + 20),
-                      static_cast<uint32_t>(bodyLen), &plistBody);
+    if (!ReadU32(p, end, outMsg.flags)) return false;
 
-        if (plistBody) {
-            outMsg.body = PlistToNSObject(plistBody);
-            plist_free(plistBody);
-        }
+    uint64_t bodyLen = 0;
+    if (!ReadU64(p, end, bodyLen)) return false;
+    if (!ReadU64(p, end, outMsg.messageId)) return false;
+
+    outMsg.body = NSObject::Null();
+    if (bodyLen == 0) return true;
+
+    if (static_cast<uint64_t>(end - p) < bodyLen || bodyLen < 8) {
+        INST_LOG_WARN(TAG, "XPC body length invalid: %llu (available=%zu)",
+                     static_cast<unsigned long long>(bodyLen), static_cast<size_t>(end - p));
+        return false;
     }
 
+    const uint8_t* bodyEnd = p + static_cast<size_t>(bodyLen);
+    uint32_t objMagic = 0;
+    uint32_t version = 0;
+    if (!ReadU32(p, bodyEnd, objMagic) || !ReadU32(p, bodyEnd, version)) return false;
+    if (objMagic != kObjectMagic || version != kBodyVersion) {
+        INST_LOG_DEBUG(TAG, "XPC object header mismatch: magic=0x%08x version=0x%08x", objMagic, version);
+        return false;
+    }
+
+    NSObject bodyObj = NSObject::Null();
+    if (!DecodeObject(p, bodyEnd, bodyObj)) {
+        uint32_t maybeType = 0;
+        if (static_cast<size_t>(bodyEnd - p) >= 4) {
+            const uint8_t* t = p;
+            maybeType = static_cast<uint32_t>(t[0])
+                      | (static_cast<uint32_t>(t[1]) << 8)
+                      | (static_cast<uint32_t>(t[2]) << 16)
+                      | (static_cast<uint32_t>(t[3]) << 24);
+        }
+        INST_LOG_WARN(TAG, "Failed to decode XPC body object (nextType=0x%08x, remaining=%zu)",
+                      maybeType, static_cast<size_t>(bodyEnd - p));
+        return false;
+    }
+    outMsg.body = std::move(bodyObj);
     return true;
 }
 

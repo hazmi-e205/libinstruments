@@ -34,16 +34,17 @@ public:
 
     // Set callback when connection is established (success=true) or failed (false)
     using ConnectedCallback = std::function<void(bool success)>;
-    void SetConnectedCallback(ConnectedCallback cb) { m_connectedCb = std::move(cb); }
+    void SetConnectedCallback(ConnectedCallback cb);
 
     // Set callback for connection errors
     using ErrorCallback = std::function<void(Error err)>;
-    void SetErrorCallback(ErrorCallback cb) { m_errorCb = std::move(cb); }
+    void SetErrorCallback(ErrorCallback cb);
 
     // Close this connection
     void Close();
 
     bool IsConnected() const { return m_connected.load(); }
+    bool HasFailed() const { return m_failed.load(); }
 
 private:
     friend class UserspaceNetwork;
@@ -51,6 +52,7 @@ private:
 
     tcp_pcb* m_pcb = nullptr;
     std::atomic<bool> m_connected{false};
+    std::atomic<bool> m_failed{false};
     RecvCallback m_recvCb;
     ConnectedCallback m_connectedCb;
     ErrorCallback m_errorCb;

@@ -64,10 +64,24 @@ size_t Http2Framer::DecodeFrame(const uint8_t* data, size_t length, H2Frame& out
     outFrame.flags = data[4];
     outFrame.streamId = ReadUint32(data + 5) & 0x7FFFFFFF;
 
-    if (payloadLen > 0) {
-        outFrame.payload.assign(data + 9, data + 9 + payloadLen);
-    } else {
-        outFrame.payload.clear();
+    outFrame.payload.clear();
+    const uint8_t* payloadStart = data + 9;
+
+    // Normalize frame payload by stripping optional HTTP/2 padding fields so
+    // upper layers (RemoteXPC) always see raw message bytes.
+    if ((outFrame.type == H2FrameType::Data || outFrame.type == H2FrameType::Headers) &&
+        (outFrame.flags & H2Flags::Padded)) {
+        if (payloadLen < 1) {
+            return 0;
+        }
+        uint8_t padLen = payloadStart[0];
+        if (static_cast<uint32_t>(padLen) + 1 > payloadLen) {
+            return 0;
+        }
+        const uint32_t contentLen = payloadLen - 1 - static_cast<uint32_t>(padLen);
+        outFrame.payload.assign(payloadStart + 1, payloadStart + 1 + contentLen);
+    } else if (payloadLen > 0) {
+        outFrame.payload.assign(payloadStart, payloadStart + payloadLen);
     }
 
     return totalLen;

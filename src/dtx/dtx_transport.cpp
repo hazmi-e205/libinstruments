@@ -16,6 +16,7 @@ using socket_t = SOCKET;
 #include <sys/socket.h>
 #include <netdb.h>
 #include <unistd.h>
+#include <cerrno>
 using socket_t = int;
 #define SOCKET_INVALID (-1)
 #define CLOSE_SOCKET ::close
@@ -81,6 +82,16 @@ DTXTransport::DTXTransport(int socketFd)
     , m_connected(socketFd >= 0)
 {
     INST_LOG_DEBUG(TAG, "Created transport from raw socket fd=%d", socketFd);
+    if (m_socketFd >= 0) {
+#ifdef _WIN32
+        DWORD tmoMs = 500;
+        setsockopt(static_cast<socket_t>(m_socketFd), SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&tmoMs), sizeof(tmoMs));
+#else
+        struct timeval tmo = {0, 500000};
+        setsockopt(m_socketFd, SOL_SOCKET, SO_RCVTIMEO, &tmo, sizeof(tmo));
+#endif
+    }
 }
 
 std::unique_ptr<DTXTransport> DTXTransport::ConnectTCP(const std::string& address, uint16_t port) {
@@ -135,13 +146,15 @@ DTXTransport::~DTXTransport() {
 
 void DTXTransport::Close() {
     m_connected = false;
-    // Ensure no concurrent Send/Receive is in-flight while closing the connection
+    // IMPORTANT: close socket without waiting for m_recvMutex.
+    // Receive() holds m_recvMutex while blocked in recv(); taking m_recvMutex here
+    // can deadlock Disconnect()->Close()->join(receiveThread).
+    if (m_socketFd >= 0) {
+        CLOSE_SOCKET(static_cast<socket_t>(m_socketFd));
+        m_socketFd = -1;
+    }
     {
-        std::scoped_lock<std::mutex, std::mutex> lock(m_recvMutex, m_sendMutex);
-        if (m_socketFd >= 0) {
-            CLOSE_SOCKET(static_cast<socket_t>(m_socketFd));
-            m_socketFd = -1;
-        }
+        std::lock_guard<std::mutex> lock(m_sendMutex);
         if (m_connection && m_ownsConnection) {
             idevice_disconnect(m_connection);
         }
@@ -165,6 +178,17 @@ bool DTXTransport::ReadExact(uint8_t* buffer, size_t length) {
                 length - totalRead, 0);
 #endif
             if (recvLen <= 0) {
+                if (!m_connected) return false;
+#ifdef _WIN32
+                int werr = WSAGetLastError();
+                if (recvLen < 0 && (werr == WSAETIMEDOUT || werr == WSAEWOULDBLOCK)) {
+                    continue;
+                }
+#else
+                if (recvLen < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == ETIMEDOUT)) {
+                    continue;
+                }
+#endif
                 INST_LOG_DEBUG(TAG, "Socket recv returned %d, disconnecting", static_cast<int>(recvLen));
                 m_connected = false;
                 return false;

@@ -53,9 +53,32 @@ typedef int sys_prot_t;
 
 /* Platform diagnostic output */
 #include <stdio.h>
+
+#if defined(__cplusplus)
+#if defined(__has_include)
+#if __has_include(<QDebug>)
+#include <QDebug>
+#define LWIP_PLATFORM_DIAG(x) do { qDebug().noquote().nospace() << x; } while(0)
+#define LWIP_PLATFORM_ASSERT(x) do { \
+    qCritical().noquote().nospace() << "lwIP assertion \"" << x << "\" failed at " << __FILE__ << ":" << __LINE__; \
+} while(0)
+#define LWIP_PLATFORM_LOG_USE_QDEBUG 1
+#elif __has_include(<QtCore/QDebug>)
+#include <QtCore/QDebug>
+#define LWIP_PLATFORM_DIAG(x) do { qDebug().noquote().nospace() << x; } while(0)
+#define LWIP_PLATFORM_ASSERT(x) do { \
+    qCritical().noquote().nospace() << "lwIP assertion \"" << x << "\" failed at " << __FILE__ << ":" << __LINE__; \
+} while(0)
+#define LWIP_PLATFORM_LOG_USE_QDEBUG 1
+#endif
+#endif
+#endif
+
+#ifndef LWIP_PLATFORM_LOG_USE_QDEBUG
 #define LWIP_PLATFORM_DIAG(x) do { printf x; } while(0)
 #define LWIP_PLATFORM_ASSERT(x) do { \
     fprintf(stderr, "lwIP assertion \"%s\" failed at %s:%d\n", x, __FILE__, __LINE__); \
 } while(0)
+#endif
 
 #endif /* LWIP_ARCH_CC_H */

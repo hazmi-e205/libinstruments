@@ -54,6 +54,10 @@
 #define TCP_QUEUE_OOSEQ             1
 #define LWIP_TCP_SACK_OUT           1
 
+// Required by this lwIP layout on some toolchains:
+// avoids ip6_reass_helper size assertion in ip6_frag.c.
+#define IPV6_FRAG_COPYHEADER        1
+
 // Single network interface (our tunnel)
 #define LWIP_SINGLE_NETIF           1
 #define LWIP_NETIF_HOSTNAME         0

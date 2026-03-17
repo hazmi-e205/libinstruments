@@ -4,7 +4,7 @@
 
 `libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
 
-**Status**: ✅ DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 18+/26+ (iOS 26.2) connection investigated (Mar 2026): USB RSD confirmed CONNREFUSED; USB-NCM auto-connect requires Apple Devices app (Microsoft Store) to install the NCM driver; external CoreDevice tunnel (go-ios / pymobiledevice3) works as fallback.
+**Status**: DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on **iOS 12 and iOS 15** via USB (Feb 2026). iOS 26.2 USB path validated (Mar 2026): USB CDTunnel/CoreDeviceProxy + RSD + DTX handshake + `runningProcesses` all working. External CoreDevice tunnel (go-ios / pymobiledevice3) remains supported fallback.
 
 ## Code Style
 
@@ -175,37 +175,40 @@ This enables multiple services to coexist on the same connection, each filtering
 
 ## iOS 17+ RSD (Remote Service Discovery)
 
-iOS 17+ devices use RSD (Remote Service Discovery) over HTTP/2 + XPC instead of the traditional lockdown-based service discovery. There are three supported paths, in order of preference:
+iOS 17+ devices use RSD (Remote Service Discovery) over HTTP/2 + XPC instead of the traditional lockdown-based service discovery. There are four supported paths, tried in order:
 
-### Path 0: USB CoreDevice QUIC Tunnel (iOS 17.x only) ⚠️ Not applicable to iOS 18+/26+
+### Path 0: USB CDTunnel / CoreDeviceProxy (iOS 17.4+, iOS 18+/26+) ✅ Primary path
 
-For iOS 18+ devices where port 58783 is refused via usbmuxd, the library automatically falls back to the CoreDevice QUIC tunnel. This path is triggered automatically when `TryUsbRSD()` fails with `CONNREFUSED`.
+**First path tried for all iOS 17+ devices.** Uses `com.apple.internal.devicecompute.CoreDeviceProxy` lockdown service (available iOS 17.4+). Works with iTunes-only — no Apple Devices app, no admin, no NCM driver required. Same approach as `go-ios tunnel start --userspace`.
 
 **How it works:**
-1. `TryUsbRSD()` fails (iOS 18+/26+) → calls `TryUsbQUIC()`
-2. `TryUsbQUIC()` calls `QUICTunnel::ConnectViaUSB(m_device)`
-3. `ConnectViaUSB` starts `com.apple.internal.dt.coredevice.free.tunnelservice` via lockdown
-4. QUIC handshake runs over the framed lockdown TCP stream (4-byte big-endian length prefix)
-5. JSON parameter exchange (same as Wi-Fi path): clientHandshakeRequest / serverHandshakeResponse
-6. lwIP network initialized with tunnel IPv6 addresses
-7. ForwardLoop thread pumps QUIC ↔ framed stream
-8. `CreateTunnelSocket(serverAddr, rsdPort)` → OS socket pair bridged to lwIP TCP
-9. `ConnectViaFd(fd)` → RSD HTTP/2+XPC handshake to discover service ports
-10. `CreateInstrumentConnection()` USB QUIC branch → `CreateTunnelSocket(serverAddr, servicePort)` → `DTXConnection::CreateFromFd(fd)`
+1. `TryUsbRSD()` fails (iOS 17+) → calls `TryUsbQUIC()`
+2. `TryUsbQUIC()` → Phase 0: tries `QUICTunnel::ConnectViaCoreDeviceProxy(m_device)`
+3. `ConnectViaCoreDeviceProxy` starts `com.apple.internal.devicecompute.CoreDeviceProxy` via lockdown
+4. Enables SSL if `svc->ssl_enabled` (service descriptor flag)
+5. CDTunnel JSON handshake: sends `CDTunnel\0` + 1-byte length + `{"type":"clientHandshakeRequest","mtu":1280}`
+6. Reads response: `CDTunnel` + 1 unknown byte + 1-byte length + JSON `{ServerAddress, ServerRSDPort, ClientParameters:{Address, Netmask, Mtu}}`
+7. lwIP network initialized with tunnel IPv6 addresses
+8. ForwardLoop thread: reads raw IPv6 packets from idevice SSL stream → `InjectPacket()` into lwIP; drains lwIP output queue → writes raw IPv6 packets to device
+9. `CreateTunnelSocket(serverAddr, rsdPort)` → OS socket pair bridged to lwIP TCP
+10. RSD HTTP/2+XPC handshake to discover service ports
+11. `CreateInstrumentConnection()` USB QUIC branch → `CreateTunnelSocket(serverAddr, servicePort)` → `DTXConnection::CreateFromFd(fd)`
 
-> **iOS 18+/26+ note**: `com.apple.internal.dt.coredevice.free.tunnelservice` is no longer available via lockdownd on iOS 18+. `TryUsbQUIC()` skips this path for `major > 17` and goes directly to `TryNetworkRSD()` → `TryDirectNCMConnection()` → external tool warning.
+**CDTunnel IPv6 packet framing:** Raw IPv6 packets, NO length prefix. Packet boundaries determined by reading 40-byte IPv6 header, extracting payload length from bytes [4:5] (big-endian uint16). Total packet = 40 + payloadLen bytes. Outgoing packets written directly via `idevice_connection_send()`.
 
 **Key implementation files (Mar 2026):**
-- `src/connection/tunnel_quic.h/cpp` — `ConnectViaUSB()`, `CreateTunnelSocket()`, `SendFramed()`, `RecvFramedPartial()`, `MakeLoopbackPair()`, `SubmitToLoop()`, `DrainTasks()`, `DrainBridges()`
-- `src/connection/userspace_network.h/cpp` — `m_connectedCb` member + `OnConnected` callback
-- `src/connection/rsd_provider.h/cpp` — `ConnectViaFd(int socketFd)`
-- `include/instruments/dtx_connection.h` + `src/dtx/dtx_connection.cpp` — `CreateFromFd(int socketFd)`
-- `include/instruments/device_connection.h` + `src/connection/device_connection.cpp` — `TryUsbQUIC()`, `m_quicTunnel`, `m_isUsbQuic`
-- `src/connection/tunnel_manager.cpp` — Step 4 USB QUIC attempt after USB RSD failure
+- `src/connection/tunnel_quic.h/cpp` — `ConnectViaCoreDeviceProxy()`, `PerformCDTunnelHandshake()`, `m_isCDTunnel`, `m_cdRecvBuf`, `m_cdOutputQueue`
+- `src/connection/device_connection.cpp` — `TryUsbQUIC()` Phase 0 CDTunnel attempt
 
-**USB stream framing:** 4-byte big-endian length prefix before each QUIC packet (same as `idevice_connection_send/receive`). Non-blocking receive uses `idevice_connection_receive_timeout(..., 0)`.
+### Path 0b: USB CoreDevice QUIC Tunnel (iOS 17.0-17.3 only)
 
-**Socket bridge architecture:** `MakeLoopbackPair()` creates two connected OS sockets. `fds[0]` returned to caller; `fds[1]` owned by `ForwardLoop`. `DrainBridges()` reads from `fds[1]` → `lwipConn->Send()`. lwIP `RecvCallback` writes to `fds[1]`. All lwIP operations happen on `ForwardLoop` thread via `SubmitToLoop()` task queue.
+Fallback for early iOS 17 devices where CoreDeviceProxy is not available. Tries `com.apple.internal.dt.coredevice.free.tunnelservice` via lockdown. Runs QUIC over a framed lockdown TCP stream. **Not applicable to iOS 18+/26+.**
+
+**Key implementation files:**
+- `src/connection/tunnel_quic.h/cpp` — `ConnectViaUSB()`, `SendFramed()`, `RecvFramedPartial()`
+- USB stream framing: 4-byte big-endian length prefix before each QUIC packet
+
+**Socket bridge architecture (both CDTunnel and QUIC paths):** `MakeLoopbackPair()` creates two connected OS sockets. `fds[0]` returned to caller; `fds[1]` owned by `ForwardLoop`. `DrainBridges()` reads from `fds[1]` → `lwipConn->Send()`. lwIP `RecvCallback` writes to `fds[1]`. All lwIP operations happen on `ForwardLoop` thread via `SubmitToLoop()` task queue.
 
 **Thread safety:** `SubmitToLoop()` queues tasks for the `ForwardLoop` thread. `DrainTasks()` is called at the top of each `ForwardLoop` iteration, ensuring lwIP API calls (like `TcpConnect`) happen on the correct thread.
 
@@ -283,13 +286,80 @@ For Wi-Fi devices without external tools. Enabled via `INSTRUMENTS_HAS_QUIC` bui
 ### Key Files (RSD + Tunnel)
 
 - `src/connection/rsd_provider.h/cpp` - RSD protocol (HTTP/2 + XPC), shared by all paths
-- `src/connection/device_connection.cpp` - `TryUsbRSD()`, USB RSD branch in `CreateInstrumentConnection()`
-- `src/connection/tunnel_quic.h/cpp` - QUIC tunnel (picoquic, `INSTRUMENTS_HAS_QUIC` only)
+- `src/connection/device_connection.cpp` - `TryUsbRSD()`, `TryUsbQUIC()` (CDTunnel Phase 0)
+- `src/connection/tunnel_quic.h/cpp` - CDTunnel + QUIC tunnel (`INSTRUMENTS_HAS_QUIC` only)
 - `src/connection/userspace_network.h/cpp` - lwIP bridge (`INSTRUMENTS_HAS_QUIC` only)
 - `src/connection/http2_framer.h/cpp` - Minimal HTTP/2 framing
 - `src/connection/lwipopts.h` - lwIP configuration
 - `src/connection/arch/cc.h` - lwIP platform config
 - `src/connection/sys_arch.c` - lwIP port: provides `sys_now()` (required by LWIP_TIMERS=1)
+
+## March 2026 iOS 26.2 Bring-up Adjustments (Complete List)
+
+This section records all practical changes made during iOS 26.2 USB bring-up. Keep this list in sync with code.
+
+### 1) RSD and RemoteXPC handshake stability
+
+- `RSDProvider::DoRSDHandshake()` updated to mirror go-ios RemoteXPC init sequence:
+  1. stream 1: `AlwaysSet` with empty dict body
+  2. stream 3: `AlwaysSet | InitHandshake` with null body
+  3. stream 1: flags `0x201` with null body
+- Added per-stream XPC reassembly for HTTP/2 DATA payloads (handles split/coalesced messages).
+- Added per-stream pending XPC queues so init-step readers do not discard later messages needed by service discovery.
+- Added stricter logs for init step replies and service response parsing.
+- Added service parsing hardening:
+  - case-insensitive key lookup
+  - nested `value` wrapper handling
+  - `Port` parsing from int/uint/string.
+
+### 2) HTTP/2 framing fixes
+
+- `Http2Framer::DecodeFrame()` now strips HTTP/2 PADDED payload bytes for DATA/HEADERS frames before passing payload upward.
+- This prevents RemoteXPC decode desync when pad length/padding bytes are present.
+
+### 3) RemoteXPC object codec fixes
+
+- `xpc_message.*` aligned to RemoteXPC wrapper/object magic and body version.
+- Added decode support for additional object types observed in real traffic:
+  - UUID (`0x0000a000`)
+  - FileTransfer (`0x0001a000`)
+- Added targeted decode diagnostics (`nextType`, remaining bytes) when body decode fails.
+
+### 4) CDTunnel + userspace network reliability
+
+- `ConnectViaCoreDeviceProxy()` and related reads made timeout-aware to avoid indefinite stalls.
+- Added SSL receive timeout tuning for CoreDeviceProxy path:
+  - longer during handshake
+  - short runtime timeout for forwarding loop responsiveness.
+- Userspace TCP connect callback path fixed to replay already-known connect/fail state when callbacks are attached late.
+- `NETIF_FLAG_POINTTOPOINT` usage guarded with `#ifdef` for lwIP versions where the flag is not defined.
+
+### 5) lwIP compatibility fixes
+
+- `lwipopts.h`: enabled `IPV6_FRAG_COPYHEADER=1` to resolve repeated assert in `ip6_frag.c`:
+  - `sizeof(struct ip6_reass_helper) <= IP6_FRAG_HLEN`
+- This was required to keep IPv6 reassembly stable under tunnel traffic.
+
+### 6) DTX over tunnel shutdown deadlock fix
+
+- `DTXTransport::Close()` changed to avoid deadlock with receive thread:
+  - close socket directly without waiting on `m_recvMutex`
+  - do not block close path behind recv lock while recv is blocked.
+- Socket mode now uses `SO_RCVTIMEO` and handles timeout-style recv errors (`EAGAIN/EWOULDBLOCK/ETIMEDOUT` on POSIX, `WSAETIMEDOUT/WSAEWOULDBLOCK` on Windows) as retry while connected.
+- This fixes hangs on teardown after successful operations (for example after process list retrieval).
+
+### 7) Logging policy and Qt integration
+
+- `src/util/log.h`: auto-detects Qt and routes logs to `qDebug` when available; otherwise falls back to stdio logging.
+- lwIP logging path (`src/connection/arch/cc.h`) also supports Qt logging when available.
+- Verbose logs are intentionally retained; do not aggressively remove "extra" tunnel/RSD/DTX logs, as they are part of diagnostics for iOS 17+/18+/26+ regressions.
+
+### 8) Current validated outcome (Mar 2026)
+
+- USB CDTunnel/CoreDeviceProxy path works on iOS 26.2.
+- RSD service discovery succeeds and returns full service map.
+- DTX handshake succeeds on `com.apple.instruments.dtservicehub`.
+- `runningProcesses` / process list request succeeds.
 
 ## Service Implementation Patterns (iOS 15 Tested)
 
@@ -515,12 +585,13 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 - Process launch/kill operations
 - Port forwarding
 - iOS 17+ USB RSD path: `TryUsbRSD()` / `ConnectViaIDevice()` — **confirmed CONNREFUSED on iOS 26.2 (Mar 2026)**. Port 58783 not accessible via usbmuxd TCP forwarding on iOS 18+. Falls through to `TryUsbQUIC()` automatically.
-- iOS 18+/26+ automatic USB connection — 3-phase fallback in `TryUsbQUIC()`:
-  - Phase 1: `TryNetworkRSD()` — Apple usbmuxd PREFER_NETWORK. Requires "Apple Devices" app (Microsoft Store) to be installed. **Tested on iOS 26.2: no network device found** — Apple Devices app not installed on test machine.
-  - Phase 2: `TryDirectNCMConnection()` — **implemented Mar 2026, requires Apple Devices app**. Enumerates host NICs (Windows: `GetAdaptersAddresses`+`GetIpNetTable2`, Linux: sysfs idVendor+netlink RTM_GETNEIGH), finds Apple USB-NCM adapter (named "Apple Mobile Device Ethernet" etc.), triggers NDP probe (`ff02::1` multicast UDP, no admin), waits 200ms, reads NDP neighbor table. **Tested on iOS 26.2: Apple USB-NCM adapter absent** — Apple Devices app not installed, so no NCM driver/adapter present.
-  - Phase 3: warn user to install Apple Devices app (Windows) or use external CoreDevice tunnel (go-ios / pymobiledevice3).
-  - `TryUsbQUIC()` / `QUICTunnel::ConnectViaUSB()` — iOS 17.x only (lockdown `com.apple.internal.dt.coredevice.free.tunnelservice`), skipped on iOS 18+.
-- **iOS 18+/26+ external tunnel**: `Instruments::CreateFromTunnel("fd61::1", 58783, "26.2")` works when go-ios / pymobiledevice3 tunnel is running. This is the current working path for iOS 26.2.
+- iOS 17.4+/18+/26+ automatic USB CDTunnel — **implemented Mar 2026** as `TryUsbQUIC()` Phase 0:
+  - **Phase 0: `ConnectViaCoreDeviceProxy()`** — CDTunnel via `com.apple.internal.devicecompute.CoreDeviceProxy`. Works with iTunes-only, no Apple Devices app, no admin. **Validated on real iOS 26.2 hardware** (RSD discovery + DTX + process list).
+  - Phase 1 (iOS 18+ fallback): `TryNetworkRSD()` — Apple usbmuxd PREFER_NETWORK. **Tested iOS 26.2: no network device found** — Apple Devices app not installed.
+  - Phase 2 (iOS 18+ fallback): `TryDirectNCMConnection()` — direct USB-NCM IPv6 discovery. **Tested iOS 26.2: Apple USB-NCM adapter absent** — NCM driver not installed.
+  - Phase 3: warns user to trust device (for CDTunnel) or install Apple Devices app (for NCM).
+  - `QUICTunnel::ConnectViaUSB()` — iOS 17.0-17.3 only fallback.
+- **iOS 18+/26+ external tunnel**: `Instruments::CreateFromTunnel("fd61::1", 58783, "26.2")` works when go-ios / pymobiledevice3 tunnel is running. This is the confirmed working path for iOS 26.2.
 - iOS 17+ QUIC tunnel (requires `INSTRUMENTS_HAS_QUIC` build flag) — for Wi-Fi devices
 - XCTest service
 - WDA service
@@ -725,3 +796,4 @@ This ensures compatibility even if version detection is imprecise or the device 
 - XCTest proxy requires handling 26+ callback methods to avoid stalling the test runner
 - Port forwarder connects via `idevice_connect()` for each accepted TCP connection
 - Performance service requires setting both system AND process attributes before starting
+
