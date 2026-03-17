@@ -58,7 +58,8 @@ jobs:
         sudo apt-get update -qq
         sudo apt-get install -y \
           cmake ninja-build pkg-config \
-          autoconf automake libtool perl
+          autoconf automake libtool perl \
+          libcurl4-openssl-dev
 
     # ── Windows: MSYS2 setup ──────────────────────────────────────────────
     - name: Set up MSYS2 (Windows)
@@ -72,6 +73,7 @@ jobs:
           mingw-w64-x86_64-ninja
           mingw-w64-x86_64-pkg-config
           mingw-w64-x86_64-toolchain
+          mingw-w64-x86_64-curl
           autoconf
           automake
           libtool
