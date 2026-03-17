@@ -18,16 +18,16 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04-large
+          - os: ubuntu-22.04
             name: Linux
             quic: false
-          - os: windows-latest-large
+          - os: windows-latest
             name: Windows
             quic: false
-          - os: ubuntu-22.04-large
+          - os: ubuntu-22.04
             name: Linux (QUIC)
             quic: true
-          - os: windows-latest-large
+          - os: windows-latest
             name: Windows (QUIC)
             quic: true
 
