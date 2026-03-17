@@ -12,6 +12,7 @@ env:
   LIBPLIST_COMMIT:           15164ebe870590376b2286b09dc97890a07dd373
   LIBIMOBILEDEVICE_GLUE_COMMIT: da770a7687f35fbb981db4d7b47b1b032cd5c2c7
   LIBUSBMUXD_COMMIT:         93eb168bf6b07472d17781328c21df0c60300524
+  LIBTATSU_COMMIT:           60a39f36d719344360ec2e87563ed43f61f0530f
   LIBIMOBILEDEVICE_COMMIT:   c4f111800d2b08d6c65ec075ad49c4a60e9e4309
   PICOTLS_COMMIT:            5a4461d8a3948d9d26bf861e7d90cb80d8093515
   PICOQUIC_COMMIT:           3335f4029b55f59a4868cacf3e92c3fb84982115
@@ -48,7 +49,7 @@ jobs:
       uses: actions/cache@v4
       with:
         path: ${{ github.workspace }}/deps
-        key: ${{ runner.os }}-deps-${{ env.OPENSSL_COMMIT }}-${{ env.LIBPLIST_COMMIT }}-${{ env.LIBIMOBILEDEVICE_GLUE_COMMIT }}-${{ env.LIBUSBMUXD_COMMIT }}-${{ env.LIBIMOBILEDEVICE_COMMIT }}
+        key: ${{ runner.os }}-deps-${{ env.OPENSSL_COMMIT }}-${{ env.LIBPLIST_COMMIT }}-${{ env.LIBIMOBILEDEVICE_GLUE_COMMIT }}-${{ env.LIBTATSU_COMMIT }}-${{ env.LIBUSBMUXD_COMMIT }}-${{ env.LIBIMOBILEDEVICE_COMMIT }}
 
     # ── Linux: build tools ────────────────────────────────────────────────
     - name: Install Linux build tools
@@ -106,6 +107,13 @@ jobs:
         ./autogen.sh --prefix=$DEPS
         make -j$(nproc) && make install
 
+        # libtatsu
+        git clone https://github.com/libimobiledevice/libtatsu /tmp/libtatsu
+        git -C /tmp/libtatsu checkout ${{ env.LIBTATSU_COMMIT }}
+        cd /tmp/libtatsu
+        ./autogen.sh --prefix=$DEPS
+        make -j$(nproc) && make install
+
         # libusbmuxd
         git clone https://github.com/libimobiledevice/libusbmuxd /tmp/libusbmuxd
         git -C /tmp/libusbmuxd checkout ${{ env.LIBUSBMUXD_COMMIT }}
@@ -149,6 +157,13 @@ jobs:
         git clone https://github.com/libimobiledevice/libimobiledevice-glue /tmp/libimobiledevice-glue
         git -C /tmp/libimobiledevice-glue checkout ${{ env.LIBIMOBILEDEVICE_GLUE_COMMIT }}
         cd /tmp/libimobiledevice-glue
+        ./autogen.sh --prefix=$DEPS --host=x86_64-w64-mingw32
+        make -j$(nproc) && make install
+
+        # libtatsu
+        git clone https://github.com/libimobiledevice/libtatsu /tmp/libtatsu
+        git -C /tmp/libtatsu checkout ${{ env.LIBTATSU_COMMIT }}
+        cd /tmp/libtatsu
         ./autogen.sh --prefix=$DEPS --host=x86_64-w64-mingw32
         make -j$(nproc) && make install
 
