@@ -491,21 +491,26 @@ Error QUICTunnel::Connect(const std::string& address, uint16_t tunnelPort) {
 
 // ---------- ConnectViaCoreDeviceProxy (CDTunnel - iOS 17.4+, iOS 18+/26+) ----------
 
-Error QUICTunnel::ConnectViaCoreDeviceProxy(idevice_t device) {
+Error QUICTunnel::ConnectViaCoreDeviceProxy(idevice_t device, lockdownd_client_t lockdown) {
     INST_LOG_INFO(TAG, "ConnectViaCoreDeviceProxy: starting CoreDeviceProxy service");
 
     // 1. Start lockdown service com.apple.internal.devicecompute.CoreDeviceProxy
-    lockdownd_client_t lockdown = nullptr;
-    if (lockdownd_client_new_with_handshake(device, &lockdown, "libinstruments")
-            != LOCKDOWN_E_SUCCESS) {
-        INST_LOG_ERROR(TAG, "ConnectViaCoreDeviceProxy: lockdown client failed");
-        return Error::ConnectionFailed;
+    lockdownd_client_t tempLockdown = nullptr;
+    bool ownsLockdown = false;
+    if (!lockdown) {
+        if (lockdownd_client_new_with_handshake(device, &tempLockdown, "libinstruments")
+                != LOCKDOWN_E_SUCCESS) {
+            INST_LOG_ERROR(TAG, "ConnectViaCoreDeviceProxy: lockdown client failed");
+            return Error::ConnectionFailed;
+        }
+        lockdown = tempLockdown;
+        ownsLockdown = true;
     }
 
     lockdownd_service_descriptor_t svcDesc = nullptr;
     lockdownd_error_t lerr = lockdownd_start_service(
         lockdown, "com.apple.internal.devicecompute.CoreDeviceProxy", &svcDesc);
-    lockdownd_client_free(lockdown);
+    if (ownsLockdown) lockdownd_client_free(tempLockdown);
 
     if (lerr != LOCKDOWN_E_SUCCESS || !svcDesc) {
         INST_LOG_DEBUG(TAG, "ConnectViaCoreDeviceProxy: service not available (err=%d) — "
@@ -795,7 +800,7 @@ Error QUICTunnel::PerformCDTunnelHandshake() {
 
 // ---------- ConnectViaUSB (QUIC - iOS 17.x lockdown path) ----------
 
-Error QUICTunnel::ConnectViaUSB(idevice_t device) {
+Error QUICTunnel::ConnectViaUSB(idevice_t device, lockdownd_client_t lockdown) {
     INST_LOG_INFO(TAG, "ConnectViaUSB: starting CoreDevice tunnel service");
 
     // iOS 18+/26 naming varies by build / entitlement profile. Try a small
@@ -808,12 +813,17 @@ Error QUICTunnel::ConnectViaUSB(idevice_t device) {
         nullptr
     };
 
-    // 1. Start lockdown service
-    lockdownd_client_t lockdown = nullptr;
-    if (lockdownd_client_new_with_handshake(device, &lockdown, "libinstruments")
-            != LOCKDOWN_E_SUCCESS) {
-        INST_LOG_ERROR(TAG, "ConnectViaUSB: lockdown client failed");
-        return Error::ConnectionFailed;
+    // 1. Start lockdown service (reuse caller's client if provided)
+    lockdownd_client_t tempLockdown = nullptr;
+    bool ownsLockdown = false;
+    if (!lockdown) {
+        if (lockdownd_client_new_with_handshake(device, &tempLockdown, "libinstruments")
+                != LOCKDOWN_E_SUCCESS) {
+            INST_LOG_ERROR(TAG, "ConnectViaUSB: lockdown client failed");
+            return Error::ConnectionFailed;
+        }
+        lockdown = tempLockdown;
+        ownsLockdown = true;
     }
 
     lockdownd_service_descriptor_t svcDesc = nullptr;
@@ -828,7 +838,7 @@ Error QUICTunnel::ConnectViaUSB(idevice_t device) {
         }
         INST_LOG_DEBUG(TAG, "ConnectViaUSB: start_service(%s) failed: %d", candidate, lerr);
     }
-    lockdownd_client_free(lockdown);
+    if (ownsLockdown) lockdownd_client_free(tempLockdown);
 
     if (lerr != LOCKDOWN_E_SUCCESS || !svcDesc || !selectedService) {
         INST_LOG_ERROR(TAG, "ConnectViaUSB: failed to start CoreDevice tunnel service (last error: %d)", lerr);

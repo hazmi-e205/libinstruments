@@ -82,6 +82,19 @@ static bool TryFindInstrumentServicePort(const std::map<std::string, uint16_t>& 
 
 DeviceConnection::DeviceConnection() = default;
 
+lockdownd_client_t DeviceConnection::EnsureLockdown() {
+    if (m_lockdown) return m_lockdown;
+    if (!m_device) return nullptr;
+    lockdownd_error_t err = lockdownd_client_new_with_handshake(
+        m_device, &m_lockdown, "libinstruments");
+    if (err != LOCKDOWN_E_SUCCESS) {
+        m_lockdown = nullptr;
+        return nullptr;
+    }
+    m_ownsLockdown = true;
+    return m_lockdown;
+}
+
 void DeviceConnection::TryUsbRSD() {
     // Attempt USB RSD for iOS 17+ devices: connect to RSD port 58783 via usbmuxd.
     // NOTE: This works only if the device exposes port 58783 via usbmuxd TCP forwarding.
@@ -381,9 +394,10 @@ void DeviceConnection::TryUsbQUIC() {
     // Helper: try CDTunnel via CoreDeviceProxy, do RSD handshake, populate services.
     // Defined as a lambda to keep it scoped and avoid unused-function warnings without QUIC.
     auto tryCDTunnelAndRSD = [](QUICTunnel& tunnel, idevice_t device,
+                                lockdownd_client_t lockdown,
                                 std::map<std::string, uint16_t>& servicesOut,
                                 std::string& serverAddrOut, uint16_t& rsdPortOut) -> bool {
-        Error err = tunnel.ConnectViaCoreDeviceProxy(device);
+        Error err = tunnel.ConnectViaCoreDeviceProxy(device, lockdown);
         if (err != Error::Success) return false;
 
         int rsdFd = tunnel.CreateTunnelSocket(tunnel.ServerAddress(), tunnel.ServerRSDPort());
@@ -433,7 +447,7 @@ void DeviceConnection::TryUsbQUIC() {
         std::map<std::string, uint16_t> services;
         std::string serverAddr;
         uint16_t rsdPort = 0;
-        if (tryCDTunnelAndRSD(*cdTunnel, m_device, services, serverAddr, rsdPort)) {
+        if (tryCDTunnelAndRSD(*cdTunnel, m_device, m_lockdown, services, serverAddr, rsdPort)) {
             m_quicTunnel = cdTunnel;
             m_tunnelAddress = serverAddr;
             m_tunnelRsdPort = rsdPort;
@@ -479,7 +493,7 @@ void DeviceConnection::TryUsbQUIC() {
                  m_iosVersion.c_str());
 
     auto quicTunnel = std::make_shared<QUICTunnel>();
-    Error err = quicTunnel->ConnectViaUSB(m_device);
+    Error err = quicTunnel->ConnectViaUSB(m_device, m_lockdown);
     if (err != Error::Success) {
         INST_LOG_WARN(TAG, "USB QUIC tunnel failed: %s — "
                      "use an external CoreDevice tunnel: "
@@ -653,8 +667,9 @@ std::shared_ptr<DeviceConnection> DeviceConnection::FromUDID(const std::string& 
     }
 
     conn->m_ownsDevice = true;
-    conn->m_iosVersion = ServiceConnector::GetIOSVersion(conn->m_device);
-    conn->m_protocol = ServiceConnector::DetectProtocol(conn->m_device);
+    conn->EnsureLockdown();
+    conn->m_iosVersion = ServiceConnector::GetIOSVersion(conn->m_device, conn->m_lockdown);
+    conn->m_protocol = ServiceConnector::DetectProtocol(conn->m_device, conn->m_lockdown);
     conn->TryUsbRSD();
 
     INST_LOG_INFO(TAG, "Connected to %s (iOS %s, protocol=%d, usbRsd=%d)",
@@ -670,8 +685,9 @@ std::shared_ptr<DeviceConnection> DeviceConnection::FromDevice(idevice_t device)
     auto conn = std::shared_ptr<DeviceConnection>(new DeviceConnection());
     conn->m_device = device;
     conn->m_ownsDevice = false;
-    conn->m_iosVersion = ServiceConnector::GetIOSVersion(device);
-    conn->m_protocol = ServiceConnector::DetectProtocol(device);
+    conn->EnsureLockdown();
+    conn->m_iosVersion = ServiceConnector::GetIOSVersion(device, conn->m_lockdown);
+    conn->m_protocol = ServiceConnector::DetectProtocol(device, conn->m_lockdown);
     conn->TryUsbRSD();
 
     INST_LOG_INFO(TAG, "Using existing device (iOS %s, protocol=%d, usbRsd=%d)",
@@ -748,18 +764,7 @@ DeviceInfo DeviceConnection::GetDeviceInfo() {
 
     // Get UDID and device name
     if (m_device) {
-        lockdownd_client_t lockdown = m_lockdown;
-        bool owns_lockdown = false;
-
-        // Create temporary lockdown if not already provided
-        // NOTE: For remote devices, caller should provide lockdown client
-        if (!lockdown) {
-            lockdownd_error_t lerr = lockdownd_client_new_with_handshake(m_device, &lockdown, "libinstruments");
-            if (lerr != LOCKDOWN_E_SUCCESS) {
-                lockdown = nullptr;
-            }
-            owns_lockdown = true;
-        }
+        lockdownd_client_t lockdown = EnsureLockdown();
 
         if (lockdown) {
             // UDID
@@ -780,10 +785,6 @@ DeviceInfo DeviceConnection::GetDeviceInfo() {
                     plist_mem_free(name);
                 }
                 plist_free(nameNode);
-            }
-
-            if (owns_lockdown) {
-                lockdownd_client_free(lockdown);
             }
         }
     }

@@ -63,12 +63,16 @@ public:
     // Starts "com.apple.internal.devicecompute.CoreDeviceProxy" lockdown service,
     // performs CDTunnel JSON handshake, then pumps raw IPv6 packets over SSL TCP.
     // Works with iTunes (no Apple Devices app required). No admin privileges needed.
-    Error ConnectViaCoreDeviceProxy(idevice_t device);
+    // lockdown: optional existing client to reuse; creates a temporary one if null.
+    Error ConnectViaCoreDeviceProxy(idevice_t device,
+                                    lockdownd_client_t lockdown = nullptr);
 
     // Connect via USB using the CoreDevice QUIC tunnel service (iOS 17.x only).
     // Starts "com.apple.internal.dt.coredevice.free.tunnelservice" lockdown service,
     // runs QUIC over the framed TCP stream.
-    Error ConnectViaUSB(idevice_t device);
+    // lockdown: optional existing client to reuse; creates a temporary one if null.
+    Error ConnectViaUSB(idevice_t device,
+                        lockdownd_client_t lockdown = nullptr);
 
     // Create a TCP socket to [destIPv6]:port through the tunnel.
     // Returns a pre-connected OS socket fd (caller owns it, must close).

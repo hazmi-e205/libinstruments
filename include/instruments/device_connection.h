@@ -102,6 +102,11 @@ private:
     // then connects directly via TCP to port 58783 — same as go-ios, no libusb needed.
     void TryDirectNCMConnection();
 
+    // Returns m_lockdown if already set; otherwise creates one from m_device,
+    // stores it in m_lockdown with m_ownsLockdown=true, and returns it.
+    // Returns nullptr if m_device is null or creation fails.
+    lockdownd_client_t EnsureLockdown();
+
     idevice_t m_device = nullptr;
     bool m_ownsDevice = false;
     lockdownd_client_t m_lockdown = nullptr;
