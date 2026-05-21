@@ -1,4 +1,5 @@
 #include "../../include/instruments/process_service.h"
+#include "../../include/instruments/dtx_message.h"
 #include "../nskeyedarchiver/nsobject.h"
 #include "../util/log.h"
 
@@ -123,62 +124,51 @@ Error ProcessService::LaunchAppDTX(const std::string& bundleId,
     auto dtxConn = m_connection->CreateInstrumentConnection();
     if (!dtxConn) return Error::ConnectionFailed;
 
-    auto channel = dtxConn->MakeChannelWithIdentifier(ChannelId::ProcessControl);
-    if (!channel) return Error::ServiceStartFailed;
+    // Step 1: launch via processcontrol (works on all iOS versions).
+    auto pcChannel = dtxConn->MakeChannelWithIdentifier(ChannelId::ProcessControl);
+    if (!pcChannel) return Error::ServiceStartFailed;
 
     auto msg = DTXMessage::CreateWithSelector(
         "launchSuspendedProcessWithDevicePath:bundleIdentifier:environment:arguments:options:");
 
-    // Arg 1: device path
     msg->AppendAuxiliary(NSObject(std::string("/private/")));
-
-    // Arg 2: bundle identifier
     msg->AppendAuxiliary(NSObject(bundleId));
 
-    // Arg 3: environment variables
     NSObject::DictType envDict;
     envDict["NSUnbufferedIO"] = NSObject(std::string("YES"));
-    for (const auto& [key, val] : env) {
-        envDict[key] = NSObject(val);
-    }
+    for (const auto& [k, v] : env) envDict[k] = NSObject(v);
     NSObject envObj(std::move(envDict));
     envObj.SetClassName("NSMutableDictionary");
     envObj.SetClassHierarchy({"NSMutableDictionary", "NSDictionary", "NSObject"});
     msg->AppendAuxiliary(envObj);
 
-    // Arg 4: arguments
     NSObject::ArrayType argsArray;
-    for (const auto& arg : args) {
-        argsArray.push_back(NSObject(arg));
-    }
+    for (const auto& a : args) argsArray.push_back(NSObject(a));
     NSObject argsObj(std::move(argsArray));
     argsObj.SetClassName("NSMutableArray");
     argsObj.SetClassHierarchy({"NSMutableArray", "NSArray", "NSObject"});
     msg->AppendAuxiliary(argsObj);
 
-    // Arg 5: options
     NSObject::DictType options;
     options["StartSuspendedKey"] = NSObject(static_cast<int64_t>(0));
-    if (killExisting) {
-        options["KillExisting"] = NSObject(static_cast<int64_t>(1));
-    }
-    options["ActivateSuspended"] = NSObject(static_cast<int64_t>(1));
+    if (killExisting) options["KillExisting"] = NSObject(static_cast<int64_t>(1));
+    // Note: do NOT set ActivateSuspended=1 — that keeps the app backgrounded (XCUITest runner pattern)
     NSObject optionsObj(std::move(options));
     optionsObj.SetClassName("NSMutableDictionary");
     optionsObj.SetClassHierarchy({"NSMutableDictionary", "NSDictionary", "NSObject"});
     msg->AppendAuxiliary(optionsObj);
 
-    auto response = channel->SendMessageSync(msg, 10000);
-    channel->Cancel();
-
-    if (!response) return Error::Timeout;
+    auto response = pcChannel->SendMessageSync(msg, 10000);
+    if (!response) { pcChannel->Cancel(); return Error::Timeout; }
 
     auto payload = response->PayloadObject();
     if (payload) {
         outPid = static_cast<int64_t>(payload->ToNumber());
-        INST_LOG_INFO(TAG, "Launched %s with PID %lld",
-                     bundleId.c_str(), (long long)outPid);
+        INST_LOG_INFO(TAG, "Launched %s with PID %lld", bundleId.c_str(), (long long)outPid);
     }
+    pcChannel->Cancel();
+
+    if (outPid <= 0) return Error::ProtocolError;
 
     return Error::Success;
 }
