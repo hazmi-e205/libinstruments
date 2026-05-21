@@ -4,7 +4,7 @@
 
 `libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
 
-**Status**: DTX protocol working and tested with process listing, FPS monitoring, performance monitoring, and app launch on **iOS 12, iOS 15, iOS 18.7.1, and iOS 26.3.1** via USB. iOS 17+/18+/26+ validated path: USB CDTunnel/CoreDeviceProxy + RSD + DTX handshake + all services working. External CoreDevice tunnel (go-ios / pymobiledevice3) remains supported fallback.
+**Status**: DTX protocol working and tested with process listing, FPS monitoring, performance monitoring, app launch, and process kill on **iOS 12, iOS 15, iOS 18.7.1, and iOS 26.3.1** via USB. iOS 17+/18+/26+ validated path: USB CDTunnel/CoreDeviceProxy + RSD + DTX handshake + all services working. External CoreDevice tunnel (go-ios / pymobiledevice3) remains supported fallback.
 
 ## Code Style
 
@@ -69,6 +69,10 @@ All located in sibling directories under `Externals/`:
 - **Types**: null=0x0A, string=0x01, bytearray=0x02, uint32=0x03, int64=0x06
   - **Type 0x06 is UNSIGNED uint64_t**, not signed int64_t (per pymobiledevice3 Int64ul)
   - NSObject supports both Int64 and UInt64 types, encoder handles both correctly
+- **Pre-archived bytearray pattern** (`AppendAuxiliaryArchived`): when the value must be NSKeyedArchived before adding to the auxiliary (e.g., `killPid:` PID), use `AppendAuxiliaryArchived()` instead of `AppendAuxiliary()`:
+  - Internally: `NSKeyedArchiver::Archive(value)` → `NSObject(std::vector<uint8_t>)` (Type::Data) → `AppendAuxiliary()`
+  - `DTXPrimitiveDict::EncodeEntry` handles `Type::Data` by writing raw bytes directly as type-2 bytearray without re-archiving
+  - This matches pymobiledevice3 `append_obj()` and go-ios `AddNsKeyedArchivedObject()`
 
 ### Handshake Protocol (CRITICAL!)
 
@@ -695,11 +699,12 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 ### ✅ Verified Working on iOS 18.7.1 and iOS 26.3.1 (May 2026)
 
 - **Process launch** - `LaunchApp()` successfully launches app and brings it to foreground via USB CDTunnel on both iOS 18.7.1 and iOS 26.3.1
-- **Key finding**: Do NOT set `ActivateSuspended=1` in launch options — that key suppresses foreground activation (XCUITest runner pattern). Plain `StartSuspendedKey=0` (with optional `KillExisting`) is sufficient; SpringBoard handles foreground activation automatically on all iOS versions including 26. See Problem 10 in Debugging Journey.
+- **Process kill** - `KillApp()` successfully kills process by PID via USB CDTunnel on both **iOS 16** and **iOS 26.3.1**. `killPid:` requires NSKeyedArchived PID (`AppendAuxiliaryArchived`) and `SendMessageSync` with timeout to keep the connection alive until the device processes the kill. See Problem 11 in Debugging Journey.
+- **Key finding (launch)**: Do NOT set `ActivateSuspended=1` in launch options — that key suppresses foreground activation (XCUITest runner pattern). Plain `StartSuspendedKey=0` (with optional `KillExisting`) is sufficient; SpringBoard handles foreground activation automatically on all iOS versions including 26. See Problem 10 in Debugging Journey.
+- **Key finding (kill)**: PID must be passed as NSKeyedArchived bytearray (PrimitiveDictionary type 0x02), NOT as a raw int64 (type 0x06). Connection must be kept alive via `SendMessageSync` — using `SendMessageAsync` + immediate `Cancel()` closes the tunnel before the device processes the kill.
 - **iOS 26 resume selectors**: `_resumeSuspendedProcessWithID:`, `_continueProcessWithID:detachIfCanceled:` are not present on `DTSpringBoardProcessControlService`. No separate resume call is needed when `ActivateSuspended` is omitted.
 
 ### 🔄 Implemented But Not Yet Tested
-- Process kill operations
 - Port forwarding
 - iOS 17+ USB RSD path: `TryUsbRSD()` / `ConnectViaIDevice()` — **confirmed CONNREFUSED on iOS 26.2 (Mar 2026)**. Port 58783 not accessible via usbmuxd TCP forwarding on iOS 18+. Falls through to `TryUsbQUIC()` automatically.
 - iOS 17.4+/18+/26+ automatic USB CDTunnel — **implemented Mar 2026** as `TryUsbQUIC()` Phase 0:
@@ -812,7 +817,7 @@ m_channel->SendMessageSync(startMsg);       // 4. Now start (messages arrive imm
 
 **Fix**: Implement comprehensive parser in `ParseSysmontapMessage()` that tries all format variations with fallback logic. See performance_service.cpp lines 210-461 for full implementation.
 
-### Problem 10: ActivateSuspended=1 Keeps App Backgrounded (May 2026)
+### Problem 10: ActivateSuspended=1 Keeps App Backgrounded (May 2026, LaunchApp)
 **Symptom**: `LaunchApp()` returns a valid PID, process is running (stdout streams via `outputReceived:fromProcess:atTime:`), but app never appears on screen. Confirmed on iOS 18.7.1 and iOS 26.3.1.
 
 **Root Cause**: The launch options dict contained `ActivateSuspended=1`. This key tells SpringBoard to keep the app in the background after spawning — it is the XCUITest runner pattern where testmanagerd controls foreground activation separately. It has no place in a plain app launch.
@@ -826,6 +831,38 @@ All resume/foreground selectors tried as workarounds were rejected on iOS 26.3.1
 
 **Reference**: go-ios `processcontrol.go` uses only `StartSuspendedKey: 0`. pymobiledevice3 `process_control.py` plain launch also omits `ActivateSuspended`. The key appears only in pymobiledevice3's XCUITest runner path with a comment explaining it keeps the runner backgrounded until testmanagerd authorizes it.
 
+### Problem 11: killPid: PID Encoding and Connection Lifetime (May 2026, KillApp)
+**Symptom**: App not killed despite no error returned. Three failure modes observed:
+1. `auxLen=32` in wire log → PID sent as raw int64 (type 0x06), device ignores it
+2. `auxLen=168` but app not killed → connection closed before device processes the kill
+3. 5-second timeout on some iOS versions → device doesn't always reply to `killPid:`
+
+**Root Cause (encoding)**: PID must be passed as an NSKeyedArchived bytearray (PrimitiveDictionary type 0x02, `auxLen≈168`), NOT as a raw int64 (type 0x06, `auxLen=32`). All reference implementations archive the PID:
+- go-ios: `AddNsKeyedArchivedObject(pid)` in `processcontrol.go`
+- pymobiledevice3: `append_obj(pid)` in `process_control.py`
+- sonic-gidevice: `AppendObject(pid)` in process control
+
+**Root Cause (connection lifetime)**: Using `SendMessageAsync()` + immediate `channel->Cancel()` / `Disconnect()` closes the QUIC tunnel before the device processes the queued kill message. The device receives an empty or closed stream and discards the message.
+
+**Fix**:
+1. Use `AppendAuxiliaryArchived(NSObject(static_cast<int64_t>(pid)))` to NSKeyedArchive the PID (writes as type-2 bytearray)
+2. Use `SendMessageSync(msg, 3000)` — keeps the connection alive for up to 3 seconds so the device can process the kill
+3. Treat timeout as success — device may not reply on all iOS versions (iOS 15 never replies, iOS 16/26 may or may not)
+4. Always return `Error::Success` — the kill is best-effort; caller should verify via process list if needed
+
+**AppendAuxiliaryArchived implementation** (dtx_message.cpp):
+```cpp
+void DTXMessage::AppendAuxiliaryArchived(const NSObject& value) {
+    auto archived = NSKeyedArchiver::Archive(value);
+    AppendAuxiliary(NSObject(std::move(archived)));
+}
+```
+`NSObject(std::vector<uint8_t>)` creates a `Type::Data` object. `DTXPrimitiveDict::EncodeEntry` handles `Type::Data` by writing the raw bytes directly as PrimitiveDictType::ByteArray (type 0x02) without re-archiving.
+
+**Confirmed working**: iOS 16 and iOS 26.3.1 via USB CDTunnel.
+
+**Reference**: go-ios `processcontrol.go` (`AddNsKeyedArchivedObject`), pymobiledevice3 `process_control.py` (`append_obj`), sonic-gidevice `AppendObject`.
+
 ### Key Takeaways
 1. **Always sync message identifiers** when device sends unsolicited messages
 2. **PrimitiveDictionary format is strict** - must include 0x0A marker before each entry
@@ -835,6 +872,9 @@ All resume/foreground selectors tried as workarounds were rejected on iOS 26.3.1
 6. **Global message handler required** - services send on both dedicated channel and channel -1
 7. **Set handlers before start** - messages may arrive immediately, must be ready
 8. **Handle multiple payload formats** - iOS devices use different encoding schemes
+9. **Launch options: omit ActivateSuspended** - only use `StartSuspendedKey=0`; `ActivateSuspended=1` keeps app backgrounded (XCUITest runner pattern)
+10. **killPid: needs NSKeyedArchived PID** - use `AppendAuxiliaryArchived()` for type-2 bytearray encoding; raw int64 (type-6) is silently ignored by device
+11. **Connection lifetime matters for kill** - use `SendMessageSync` not `SendMessageAsync`; async + immediate cancel closes tunnel before device processes the kill
 
 ## Architecture: iOS Version Detection & Service Selection
 

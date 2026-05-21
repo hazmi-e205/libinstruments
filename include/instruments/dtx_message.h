@@ -84,6 +84,8 @@ public:
 
     // Auxiliary data - method arguments
     void AppendAuxiliary(const NSObject& value);
+    // Always encodes value via NSKeyedArchiver (type 2 bytearray), matching pymobiledevice3 append_obj()
+    void AppendAuxiliaryArchived(const NSObject& value);
     std::vector<NSObject> AuxiliaryObjects() const;
     const std::vector<uint8_t>& RawAuxiliary() const { return m_auxiliary; }
 

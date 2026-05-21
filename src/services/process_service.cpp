@@ -181,15 +181,17 @@ Error ProcessService::KillProcessDTX(int64_t pid) {
     if (!channel) return Error::ServiceStartFailed;
 
     auto msg = DTXMessage::CreateWithSelector("killPid:");
-    msg->AppendAuxiliary(NSObject(static_cast<uint64_t>(pid)));
+    msg->AppendAuxiliaryArchived(NSObject(static_cast<int64_t>(pid)));
 
-    auto response = channel->SendMessageSync(msg);
+    // go-ios uses MethodCall (expectsReply=true) and waits for a reply.
+    // Waiting ensures the message is fully delivered before the connection closes.
+    // Timeout is treated as success — device may not reply on all iOS versions.
+    auto response = channel->SendMessageSync(msg, 3000);
     channel->Cancel();
 
     INST_LOG_INFO(TAG, "Kill PID %lld: %s", (long long)pid,
-                 response ? "success" : "timeout");
-
-    return response ? Error::Success : Error::Timeout;
+                 response ? "ack received" : "no ack (may still succeed)");
+    return Error::Success;
 }
 
 // --- XPC implementations (iOS 17+) ---

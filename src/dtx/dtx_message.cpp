@@ -267,6 +267,14 @@ void DTXMessage::AppendAuxiliary(const NSObject& value) {
     m_auxiliary = DTXPrimitiveDict::Encode(m_auxItems);
 }
 
+void DTXMessage::AppendAuxiliaryArchived(const NSObject& value) {
+    // NSKeyedArchive the value and store as NSObject(Data) so DTXPrimitiveDict
+    // writes it as type-2 bytearray without re-archiving. Matches pymobiledevice3
+    // append_obj() and go-ios AddNsKeyedArchivedObject().
+    auto archived = NSKeyedArchiver::Archive(value);
+    AppendAuxiliary(NSObject(std::move(archived)));
+}
+
 std::vector<NSObject> DTXMessage::AuxiliaryObjects() const {
     if (m_auxiliary.empty()) return {};
     return DTXPrimitiveDict::Decode(m_auxiliary);

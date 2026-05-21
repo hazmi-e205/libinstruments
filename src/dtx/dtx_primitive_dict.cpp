@@ -67,6 +67,16 @@ std::vector<uint8_t> DTXPrimitiveDict::EncodeEntry(const NSObject& item) {
             WriteLE64(entry, static_cast<uint64_t>(item.AsInt64()));
             break;
         }
+        case NSObject::Type::Data: {
+            // Raw bytes written directly as type 2 bytearray (no NSKeyedArchive wrapping).
+            // Use this when the caller has already archived the value — e.g. AppendAuxiliary
+            // with NSObject(NSKeyedArchiver::Archive(x)) to match pymobiledevice3 append_obj().
+            const auto& data = item.AsData();
+            WriteLE32(entry, PrimitiveDictType::ByteArray);
+            WriteLE32(entry, static_cast<uint32_t>(data.size()));
+            entry.insert(entry.end(), data.begin(), data.end());
+            break;
+        }
         default: {
             // Everything else gets NSKeyedArchiver-encoded as a byte array
             std::vector<uint8_t> archived = NSKeyedArchiver::Archive(item);
