@@ -4,7 +4,7 @@
 
 `libinstruments` is a **production-ready**, pure C++20 static library that implements Apple's Instruments (DTX) protocol for communicating with iOS devices. It lives at `Externals/libinstruments/` within the iDebugTool project and replaces the older `libnskeyedarchiver` + `libidevice` externals with a single, self-contained library.
 
-**Status**: DTX protocol working and tested with process listing, FPS monitoring, and performance monitoring on **iOS 12, iOS 15, and iOS 26.2** via USB. iOS 26.2 validated path (Mar 2026): USB CDTunnel/CoreDeviceProxy + RSD + DTX handshake + DeviceInfo/graphics.opengl/sysmontap services working. External CoreDevice tunnel (go-ios / pymobiledevice3) remains supported fallback.
+**Status**: DTX protocol working and tested with process listing, FPS monitoring, performance monitoring, and app launch on **iOS 12, iOS 15, iOS 18.7.1, and iOS 26.3.1** via USB. iOS 17+/18+/26+ validated path: USB CDTunnel/CoreDeviceProxy + RSD + DTX handshake + all services working. External CoreDevice tunnel (go-ios / pymobiledevice3) remains supported fallback.
 
 ## Code Style
 
@@ -183,8 +183,8 @@ iOS 17+ devices use RSD (Remote Service Discovery) over HTTP/2 + XPC instead of 
 
 **How it works:**
 1. `TryUsbRSD()` fails (iOS 17+) → calls `TryUsbQUIC()`
-2. `TryUsbQUIC()` → Phase 0: tries `QUICTunnel::ConnectViaCoreDeviceProxy(m_device)`
-3. `ConnectViaCoreDeviceProxy` starts `com.apple.internal.devicecompute.CoreDeviceProxy` via lockdown
+2. `TryUsbQUIC()` → Phase 0: tries `QUICTunnel::ConnectViaCoreDeviceProxy(m_device, m_lockdown)`
+3. `ConnectViaCoreDeviceProxy` starts `com.apple.internal.devicecompute.CoreDeviceProxy` via the provided lockdown (or creates a temporary one if null)
 4. Enables SSL if `svc->ssl_enabled` (service descriptor flag)
 5. CDTunnel JSON handshake: sends `CDTunnel\0` + 1-byte length + `{"type":"clientHandshakeRequest","mtu":1280}`
 6. Reads response: `CDTunnel` + 1 unknown byte + 1-byte length + JSON `{ServerAddress, ServerRSDPort, ClientParameters:{Address, Netmask, Mtu}}`
@@ -408,6 +408,62 @@ These were the key cross-version findings from real-device validation:
 5. Final validated matrix:
 - iOS 15 (legacy USB DTX/SSL): process list, FPS, performance: working.
 - iOS 26.2 (USB CDTunnel + RSD + DTX): process list, FPS, performance: working.
+
+## idevice_t and lockdownd_client_t Ownership Model (May 2026)
+
+`DeviceConnection` owns at most **one** `lockdownd_client_t` for its entire lifetime. Every internal operation that previously created its own temporary lockdown now reuses it.
+
+### Ownership flags
+
+```cpp
+idevice_t          m_device;       // USB device handle
+bool               m_ownsDevice;   // true when created by FromUDID()
+lockdownd_client_t m_lockdown;     // single shared lockdown client
+bool               m_ownsLockdown; // true when created by EnsureLockdown()
+```
+
+### EnsureLockdown()
+
+Private helper that creates `m_lockdown` on first call and caches it:
+
+```cpp
+lockdownd_client_t DeviceConnection::EnsureLockdown() {
+    if (m_lockdown) return m_lockdown;      // already have one — reuse
+    if (!m_device)  return nullptr;
+    lockdownd_error_t err = lockdownd_client_new_with_handshake(
+        m_device, &m_lockdown, "libinstruments");
+    if (err != LOCKDOWN_E_SUCCESS) { m_lockdown = nullptr; return nullptr; }
+    m_ownsLockdown = true;
+    return m_lockdown;
+}
+```
+
+Called from: `FromUDID()`, `FromDevice(device)`, `GetDeviceInfo()`.  
+Caller-provided lockdown (`FromDevice(device, lockdown)`) is stored directly and never freed by `DeviceConnection`.
+
+### Lockdown creation count per factory flow
+
+| Factory | lockdown creates | notes |
+|---------|-----------------|-------|
+| `Create(udid)` | **1** | `EnsureLockdown()` in `FromUDID()` |
+| `Create(device)` | **1** | `EnsureLockdown()` in `FromDevice(device)` |
+| `Create(device, lockdown)` | **0** | caller's lockdown stored, never freed |
+| `GetDeviceInfo()` | **0** | reuses `m_lockdown` via `EnsureLockdown()` |
+| `CreateInstrumentConnection()` | **0** | passes `m_lockdown` to `StartInstrumentService()` |
+| `ConnectViaCoreDeviceProxy()` | **0** | receives `m_lockdown` from `TryUsbQUIC()` |
+| `ConnectViaUSB()` | **0** | receives `m_lockdown` from `TryUsbQUIC()` |
+
+`ConnectViaCoreDeviceProxy(device, lockdown=nullptr)` and `ConnectViaUSB(device, lockdown=nullptr)` still accept an optional lockdown parameter with a `nullptr` default for backward compatibility; if null they create a local temporary (freed in the same function).
+
+### Destructor ownership
+
+```cpp
+DeviceConnection::~DeviceConnection() {
+    if (m_lockdown && m_ownsLockdown) lockdownd_client_free(m_lockdown);
+    if (m_device   && m_ownsDevice)   idevice_free(m_device);
+    if (m_networkDevice)              idevice_free(m_networkDevice); // always owned
+}
+```
 
 ## Service Implementation Patterns (iOS 15 Tested)
 
@@ -636,8 +692,14 @@ Don't use old dependencies `libidevice` and `libnskeyedarchiver` as code referen
 - **RSD + service discovery** - RSD handshake succeeds and discovers full service map.
 - **DTX connection** - Channel creation and sync calls work on `com.apple.instruments.dtservicehub`.
 
+### ✅ Verified Working on iOS 18.7.1 and iOS 26.3.1 (May 2026)
+
+- **Process launch** - `LaunchApp()` successfully launches app and brings it to foreground via USB CDTunnel on both iOS 18.7.1 and iOS 26.3.1
+- **Key finding**: Do NOT set `ActivateSuspended=1` in launch options — that key suppresses foreground activation (XCUITest runner pattern). Plain `StartSuspendedKey=0` (with optional `KillExisting`) is sufficient; SpringBoard handles foreground activation automatically on all iOS versions including 26. See Problem 10 in Debugging Journey.
+- **iOS 26 resume selectors**: `_resumeSuspendedProcessWithID:`, `_continueProcessWithID:detachIfCanceled:` are not present on `DTSpringBoardProcessControlService`. No separate resume call is needed when `ActivateSuspended` is omitted.
+
 ### 🔄 Implemented But Not Yet Tested
-- Process launch/kill operations
+- Process kill operations
 - Port forwarding
 - iOS 17+ USB RSD path: `TryUsbRSD()` / `ConnectViaIDevice()` — **confirmed CONNREFUSED on iOS 26.2 (Mar 2026)**. Port 58783 not accessible via usbmuxd TCP forwarding on iOS 18+. Falls through to `TryUsbQUIC()` automatically.
 - iOS 17.4+/18+/26+ automatic USB CDTunnel — **implemented Mar 2026** as `TryUsbQUIC()` Phase 0:
@@ -749,6 +811,20 @@ m_channel->SendMessageSync(startMsg);       // 4. Now start (messages arrive imm
 3. Array-packed format with "ProcessesAttributes" and flat "System" array
 
 **Fix**: Implement comprehensive parser in `ParseSysmontapMessage()` that tries all format variations with fallback logic. See performance_service.cpp lines 210-461 for full implementation.
+
+### Problem 10: ActivateSuspended=1 Keeps App Backgrounded (May 2026)
+**Symptom**: `LaunchApp()` returns a valid PID, process is running (stdout streams via `outputReceived:fromProcess:atTime:`), but app never appears on screen. Confirmed on iOS 18.7.1 and iOS 26.3.1.
+
+**Root Cause**: The launch options dict contained `ActivateSuspended=1`. This key tells SpringBoard to keep the app in the background after spawning — it is the XCUITest runner pattern where testmanagerd controls foreground activation separately. It has no place in a plain app launch.
+
+All resume/foreground selectors tried as workarounds were rejected on iOS 26.3.1 ("does not respond to selector"):
+- `_resumeSuspendedProcessWithID:` on processcontrol
+- `_continueProcessWithID:detachIfCanceled:` on processcontrol
+- `openApplicationWithBundleID:` on mobilenotifications
+
+**Fix**: Remove `ActivateSuspended` from the options dict entirely. With only `StartSuspendedKey=0` (and optionally `KillExisting=1`), SpringBoard brings the app to foreground automatically on all iOS versions.
+
+**Reference**: go-ios `processcontrol.go` uses only `StartSuspendedKey: 0`. pymobiledevice3 `process_control.py` plain launch also omits `ActivateSuspended`. The key appears only in pymobiledevice3's XCUITest runner path with a comment explaining it keeps the runner backgrounded until testmanagerd authorizes it.
 
 ### Key Takeaways
 1. **Always sync message identifiers** when device sends unsolicited messages
