@@ -16,6 +16,7 @@
 #include "xctest_service.h"
 #include "wda_service.h"
 #include "port_forwarder.h"
+#include "debugger_service.h"
 
 namespace instruments {
 
@@ -68,6 +69,7 @@ public:
     XCTestService& XCTest();
     WDAService& WDA();
     PortForwarder& Ports();
+    DebuggerService& Debug();
 
     // Get the underlying connection
     std::shared_ptr<DeviceConnection> Connection() const { return m_connection; }
@@ -90,6 +92,7 @@ private:
     std::unique_ptr<XCTestService> m_xctest;
     std::unique_ptr<WDAService> m_wda;
     std::unique_ptr<PortForwarder> m_ports;
+    std::unique_ptr<DebuggerService> m_debugger;
 };
 
 } // namespace instruments

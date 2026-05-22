@@ -104,6 +104,7 @@ set(LIB_SOURCES
     src/services/xctest_service.cpp
     src/services/wda_service.cpp
     src/services/port_forwarder.cpp
+    src/services/debugger_service.cpp
 
     # Facade
     src/instruments.cpp
@@ -123,6 +124,7 @@ set(LIB_HEADERS
     include/instruments/xctest_service.h
     include/instruments/wda_service.h
     include/instruments/port_forwarder.h
+    include/instruments/debugger_service.h
 )
 
 # Create library

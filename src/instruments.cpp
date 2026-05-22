@@ -15,6 +15,7 @@ Instruments::~Instruments() {
     if (m_xctest) m_xctest->Stop();
     if (m_wda) m_wda->Stop();
     if (m_ports) m_ports->StopAll();
+    if (m_debugger) { m_debugger->Stop(); m_debugger->StopDebugServer(); }
 }
 
 std::shared_ptr<Instruments> Instruments::Create(const std::string& udid) {
@@ -82,6 +83,13 @@ PortForwarder& Instruments::Ports() {
         m_ports = std::make_unique<PortForwarder>(m_connection);
     }
     return *m_ports;
+}
+
+DebuggerService& Instruments::Debug() {
+    if (!m_debugger) {
+        m_debugger = std::make_unique<DebuggerService>(m_connection);
+    }
+    return *m_debugger;
 }
 
 void Instruments::SetLogLevel(LogLevel level) {
